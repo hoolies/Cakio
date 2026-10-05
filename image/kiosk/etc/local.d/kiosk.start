@@ -1,0 +1,35 @@
+#!/bin/sh
+# Boot-time setup for the camera kiosk (runs as root from the local service).
+
+# Processes of other users are hidden; the camera URL is on ffmpeg's command line.
+mount -o remount,hidepid=2 /proc 2>/dev/null
+
+# Logs the kiosk user can write and the administrator can read.
+mkdir -p /var/log/kiosk
+chown cakio:cakio /var/log/kiosk
+chmod 755 /var/log/kiosk
+
+# Home directories, in case the saved configuration lacks them.
+mkdir -p /home/cakio /home/kioskadm
+chown cakio:cakio /home/cakio
+chown kioskadm:kioskadm /home/kioskadm
+chmod 700 /home/cakio /home/kioskadm
+
+# Compressed swap in RAM. The whole system lives in memory and the unit has
+# no disk swap, so when nine players get large the choice is between the
+# kernel killing one of them and squeezing idle pages (the unused half of
+# the root filesystem, player buffers) into zram at about a third of their
+# size. Sized at half the memory; it costs nothing while unused.
+if modprobe zram 2>/dev/null && [ -e /sys/block/zram0/disksize ]; then
+    mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+    printf 'zstd\n' >/sys/block/zram0/comp_algorithm 2>/dev/null ||
+        printf 'lz4\n' >/sys/block/zram0/comp_algorithm 2>/dev/null || true
+    if printf '%sK\n' "$((mem_kb / 2))" >/sys/block/zram0/disksize 2>/dev/null &&
+        mkswap /dev/zram0 >/dev/null 2>&1; then
+        swapon -p 100 /dev/zram0 2>/dev/null || logger -t kiosk 'zram swap could not be enabled'
+    fi
+else
+    logger -t kiosk 'zram module not available; running without swap'
+fi
+
+exit 0

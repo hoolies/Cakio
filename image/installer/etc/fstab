@@ -1,0 +1,2 @@
+LABEL=CAKIOUSB	/media/cakiousb	vfat	noauto,rw	0 0
+tmpfs	/tmp	tmpfs	nosuid,nodev	0 0

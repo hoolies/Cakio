@@ -1,0 +1,264 @@
+#!/usr/bin/env sh
+# kiosk-apply - change the configuration of this camera kiosk.
+#
+# Run as root (doas kiosk-apply COMMAND ...), normally by kiosk-admin over
+# SSH. Changes take effect at once; "commit" saves them to the internal disk
+# so they survive a reboot.
+
+set -eu
+
+export LC_ALL=C
+
+readonly PROGNAME=kiosk-apply
+readonly KIOSK_DIR=/etc/kiosk
+readonly LAYOUT=$KIOSK_DIR/layout.conf
+readonly CREDS=$KIOSK_DIR/camera.env
+readonly HOST_KEY=/etc/ssh/ssh_host_ed25519_key
+readonly HOST_CERT=/etc/ssh/ssh_host_ed25519_key-cert.pub
+readonly HOST_CERT_CONF=/etc/ssh/sshd_config.d/10-hostcert.conf
+readonly MEDIA=/media/cakio
+readonly CRONTAB=/etc/crontabs/root
+readonly CRON_MARK='# cakio daily reboot'
+
+usage() {
+    printf '%s\n' "Usage: $PROGNAME COMMAND [ARG]...
+Change the configuration of this camera kiosk.
+
+Commands:
+  hostname NAME     set the hostname (whid-cakio-location)
+  layout [FILE]     install a camera layout from FILE or standard input
+  creds             install camera credentials: two lines on standard input,
+                      CAMERA_USER=... and CAMERA_PASSWORD=...
+  reboot-time TIME  restart the kiosk every day at TIME (24-hour HH:MM,
+                      local time), or never with TIME none
+  hostcert          install the SSH host certificate from standard input
+  clock SECONDS     set the clock to SECONDS since 1970 and save it to the RTC
+  restart           start the camera wall again
+  commit            save the configuration to the internal disk
+  show              print the current settings (without the password)
+
+  -h, --help        display this help and exit"
+}
+
+die() {
+    printf '%s: %s\n' "$PROGNAME" "$1" >&2
+    exit 1
+}
+
+usage_error() {
+    printf '%s: %s\n' "$PROGNAME" "$1" >&2
+    printf "Try '%s --help' for more information.\n" "$PROGNAME" >&2
+    exit 2
+}
+
+require_root() {
+    [ "$(id -u)" -eq 0 ] || die 'must run as root (use doas)'
+}
+
+# Writes standard input to $1 with mode $2 and owner $3, replacing it in one step.
+install_from_stdin() {
+    _is_tmp="$1.tmp.$$"
+    umask 077
+    cat >"$_is_tmp"
+    chmod "$2" "$_is_tmp"
+    chown "$3" "$_is_tmp"
+    mv -f -- "$_is_tmp" "$1"
+}
+
+restart_wall() {
+    # The X session exits when the camera wall (or the waiting screen) stops;
+    # kiosk-session then starts a fresh session with the new settings.
+    pkill -TERM -f "kiosk-mosaic $LAYOUT" 2>/dev/null || true
+    pkill -TERM -x ffplay 2>/dev/null || true
+    printf 'camera wall restarting\n'
+}
+
+cmd_hostname() {
+    [ $# -eq 1 ] || usage_error 'hostname needs exactly one NAME'
+    case $1 in
+        *[!a-z0-9-]* | -* | *- | '') die "invalid hostname '$1' (lowercase letters, digits, and hyphens)" ;;
+    esac
+    [ "${#1}" -le 63 ] || die 'hostname is longer than 63 characters'
+    printf '%s\n' "$1" >/etc/hostname
+    hostname "$1"
+    if [ -f /etc/network/interfaces ]; then
+        sed -i "s/^\([[:space:]]*udhcpc_opts .*hostname:\)[^ ]*/\1$1/" /etc/network/interfaces
+    fi
+    printf 'hostname set to %s\n' "$1"
+}
+
+cmd_layout() {
+    [ $# -le 1 ] || usage_error 'layout takes at most one FILE'
+    _cl_tmp=$(mktemp /tmp/layout.XXXXXX)
+    if [ $# -eq 1 ]; then
+        cat -- "$1" >"$_cl_tmp"
+    else
+        cat >"$_cl_tmp"
+    fi
+    # kiosk-mosaic checks the file; its own messages explain any problem.
+    if ! kiosk-mosaic --print --interface none --hwdec none "$_cl_tmp" >/dev/null; then
+        rm -f -- "$_cl_tmp"
+        die 'the layout was not installed'
+    fi
+    mkdir -p "$KIOSK_DIR"
+    chmod 644 "$_cl_tmp"
+    mv -f -- "$_cl_tmp" "$LAYOUT"
+    printf 'layout installed (%s cameras)\n' "$(grep -c '^[[:space:]]*[A-Za-z0-9_]*|' "$LAYOUT")"
+    restart_wall
+}
+
+cmd_creds() {
+    [ $# -eq 0 ] || usage_error 'creds takes no arguments; give the lines on standard input'
+    _cc_content=$(cat)
+    case $_cc_content in
+        CAMERA_USER=?*"
+"CAMERA_PASSWORD=?*) ;;
+        *) die 'expected two lines: CAMERA_USER=... and CAMERA_PASSWORD=...' ;;
+    esac
+    mkdir -p "$KIOSK_DIR"
+    printf '%s\n' "$_cc_content" | install_from_stdin "$CREDS" 0440 root:cakio
+    printf 'camera credentials installed\n'
+    restart_wall
+}
+
+# Prints $1 as HH:MM when it is a valid 24-hour time; fails otherwise.
+normalize_time() {
+    case $1 in
+        [0-9]:[0-9][0-9]) set -- "0$1" ;;
+        [0-9][0-9]:[0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    _nt_h=${1%%:*}
+    _nt_m=${1##*:}
+    [ "$_nt_h" -le 23 ] && [ "$_nt_m" -le 59 ] || return 1
+    printf '%s\n' "$1"
+}
+
+# Prints the daily reboot time from the crontab, or "none".
+reboot_time() {
+    _rt_line=$(grep -- "$CRON_MARK\$" "$CRONTAB" 2>/dev/null | head -n 1)
+    if [ -z "$_rt_line" ]; then
+        printf 'none\n'
+        return 0
+    fi
+    printf '%s\n' "$_rt_line" | awk '{ printf "%02d:%02d\n", $2, $1 }'
+}
+
+cmd_reboot_time() {
+    [ $# -eq 1 ] || usage_error 'reboot-time needs a TIME (HH:MM) or none'
+    case $1 in
+        none | off) _crt_time='' ;;
+        *) _crt_time=$(normalize_time "$1") || die "invalid time '$1' (use 24-hour HH:MM, or none)" ;;
+    esac
+    mkdir -p "${CRONTAB%/*}"
+    [ -f "$CRONTAB" ] || : >"$CRONTAB"
+    _crt_tmp="$CRONTAB.tmp.$$"
+    grep -v -- "$CRON_MARK\$" "$CRONTAB" >"$_crt_tmp" || true
+    if [ -n "$_crt_time" ]; then
+        _crt_h=${_crt_time%%:*}
+        _crt_m=${_crt_time##*:}
+        printf '%s %s * * * /usr/local/bin/kiosk-nightly %s\n' "${_crt_m#0}" "${_crt_h#0}" "$CRON_MARK" >>"$_crt_tmp"
+    fi
+    chmod 600 "$_crt_tmp"
+    mv -f -- "$_crt_tmp" "$CRONTAB"
+    # crond notices the change through the directory's modification time.
+    touch "${CRONTAB%/*}"
+    rc-service crond status >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+    if [ -n "$_crt_time" ]; then
+        printf 'daily reboot at %s\n' "$_crt_time"
+    else
+        printf 'daily reboot turned off\n'
+    fi
+}
+
+cmd_hostcert() {
+    [ $# -eq 0 ] || usage_error 'hostcert takes no arguments; give the certificate on standard input'
+    _ch_tmp=$(mktemp /tmp/hostcert.XXXXXX)
+    cat >"$_ch_tmp"
+    ssh-keygen -L -f "$_ch_tmp" >/dev/null 2>&1 || {
+        rm -f -- "$_ch_tmp"
+        die 'that is not an SSH certificate'
+    }
+    _ch_want=$(ssh-keygen -lf "$HOST_KEY.pub" | awk '{ print $2 }')
+    _ch_have=$(ssh-keygen -L -f "$_ch_tmp" | awk '/Public key:/ { print $NF }')
+    [ "$_ch_want" = "$_ch_have" ] || {
+        rm -f -- "$_ch_tmp"
+        die 'the certificate is for a different host key'
+    }
+    chmod 644 "$_ch_tmp"
+    mv -f -- "$_ch_tmp" "$HOST_CERT"
+    mkdir -p "${HOST_CERT_CONF%/*}"
+    printf 'HostCertificate %s\n' "$HOST_CERT" >"$HOST_CERT_CONF"
+    sshd -t || die 'sshd rejected the new configuration; certificate removed'
+    rc-service sshd restart >/dev/null 2>&1 || die 'sshd did not restart'
+    printf 'host certificate installed\n'
+}
+
+cmd_clock() {
+    [ $# -eq 1 ] || usage_error 'clock needs the time in seconds since 1970'
+    case $1 in
+        '' | *[!0-9]*) die "invalid time '$1'" ;;
+    esac
+    date -s "@$1" >/dev/null
+    hwclock -w 2>/dev/null || true
+    printf 'clock set to %s\n' "$(date)"
+}
+
+cmd_commit() {
+    [ $# -eq 0 ] || usage_error 'commit takes no arguments'
+    lbu commit -d || die 'lbu commit failed'
+    # lbu names the file after the hostname; drop files from earlier names.
+    _cm_keep="$(hostname).apkovl.tar.gz"
+    mount -o remount,rw "$MEDIA" 2>/dev/null || true
+    for _cm_file in "$MEDIA"/*.apkovl.tar.gz; do
+        [ -e "$_cm_file" ] || continue
+        [ "${_cm_file##*/}" != "$_cm_keep" ] || continue
+        rm -f -- "$_cm_file"
+    done
+    sync
+    mount -o remount,ro "$MEDIA" 2>/dev/null || true
+    printf 'configuration saved\n'
+}
+
+cmd_show() {
+    printf 'hostname: %s\n' "$(hostname)"
+    if [ -f "$LAYOUT" ]; then
+        printf 'layout: %s cameras\n' "$(grep -c '^[[:space:]]*[A-Za-z0-9_]*|' "$LAYOUT")"
+    else
+        printf 'layout: none\n'
+    fi
+    if [ -f "$CREDS" ]; then
+        printf 'camera user: %s\n' "$(sed -n 's/^CAMERA_USER=//p' "$CREDS")"
+    else
+        printf 'camera credentials: none\n'
+    fi
+    printf 'daily reboot: %s\n' "$(reboot_time)"
+    if [ -f "$HOST_CERT" ]; then
+        printf 'host certificate: %s\n' "$(ssh-keygen -L -f "$HOST_CERT" | awk '/Valid:/ { $1 = ""; print }')"
+    else
+        printf 'host certificate: none\n'
+    fi
+}
+
+main() {
+    [ $# -ge 1 ] || usage_error 'missing command'
+    case $1 in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        hostname | layout | creds | reboot-time | hostcert | clock | restart | commit | show) ;;
+        -*) usage_error "unrecognized option '$1'" ;;
+        *) usage_error "unknown command '$1'" ;;
+    esac
+    _mn_cmd=$1
+    shift
+    require_root
+    case $_mn_cmd in
+        restart) restart_wall ;;
+        reboot-time) cmd_reboot_time "$@" ;;
+        *) "cmd_$_mn_cmd" "$@" ;;
+    esac
+}
+
+main "$@"

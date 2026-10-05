@@ -1,0 +1,1 @@
+# Empty on purpose: keep the kernel's eth0 name instead of enp2s0-style names.

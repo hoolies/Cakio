@@ -1,0 +1,4 @@
+# The internal disk holds the boot files, the packages, and the saved
+# configuration. It is mounted read-only; lbu remounts it when it commits.
+LABEL=CAKIO	/media/cakio	vfat	noauto,ro	0 0
+tmpfs	/tmp	tmpfs	nosuid,nodev	0 0

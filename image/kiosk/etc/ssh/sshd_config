@@ -1,0 +1,29 @@
+# sshd settings for the camera kiosk.
+#
+# Only the administrator account can log in, and only with a certificate
+# signed by the kiosk user CA. Passwords and plain keys are not accepted.
+# Enrollment adds the host certificate in sshd_config.d.
+
+Include /etc/ssh/sshd_config.d/*.conf
+
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+AllowUsers kioskadm
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile none
+TrustedUserCAKeys /etc/ssh/kiosk_user_ca.pub
+AuthorizedPrincipalsFile /etc/ssh/principals/%u
+
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitTunnel no
+PrintMotd no
+ClientAliveInterval 60
+ClientAliveCountMax 3
+LogLevel INFO
+
+Subsystem sftp internal-sftp

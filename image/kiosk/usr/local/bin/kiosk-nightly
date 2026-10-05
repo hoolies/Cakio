@@ -1,0 +1,42 @@
+#!/usr/bin/env sh
+# kiosk-nightly - the daily restart of the camera kiosk, run by cron as root.
+#
+# A reboot every day gives the unit a clean start (fresh X server, fresh
+# players, memory back to zero) and applies anything staged on the disk for
+# the next boot. The wall is back in about a minute.
+
+set -u
+
+export LC_ALL=C
+
+readonly PROGNAME=kiosk-nightly
+
+usage() {
+    printf '%s\n' "Usage: $PROGNAME [OPTION]...
+Restart this camera kiosk; run by cron at the time set with kiosk-apply.
+
+  -h, --help    display this help and exit"
+}
+
+case ${1:-} in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    '') ;;
+    *)
+        printf '%s: unrecognized option %s\n' "$PROGNAME" "'$1'" >&2
+        printf "Try '%s --help' for more information.\n" "$PROGNAME" >&2
+        exit 2
+        ;;
+esac
+
+[ "$(id -u)" -eq 0 ] || {
+    printf '%s: must run as root\n' "$PROGNAME" >&2
+    exit 1
+}
+
+logger -t "$PROGNAME" "daily reboot ($(uptime))"
+sync
+sleep 2
+exec reboot

@@ -1,0 +1,537 @@
+#!/usr/bin/env sh
+# kiosk-provision - install the camera kiosk onto the internal disk.
+#
+# Runs on the console of the installer stick. Asks for the hostname, the
+# layout, and the camera credentials, erases the internal disk, installs the
+# kiosk system, and writes a record of the unit to the stick.
+
+set -eu
+
+export LC_ALL=C
+
+readonly PROGNAME=kiosk-provision
+readonly STICK=/media/cakiousb
+readonly TARGET=/mnt/cakio
+readonly OVL=/tmp/cakio-ovl
+
+RELEASE=''
+DISK=''
+PART=''
+HOSTNAME_NEW=''
+LAYOUT_FILE=''
+CAM_USER=''
+CAM_PASS=''
+REBOOT_TIME=''
+# Defaults written onto the stick by kiosk-build.sh write.
+DEF_USER=''
+DEF_PASS=''
+DEF_LAYOUT=''
+
+say() {
+    printf '%s\n' "$1"
+}
+
+fail() {
+    printf '\n%s: %s\n' "$PROGNAME" "$1" >&2
+    printf 'Press Enter for a shell, or hold the power button to turn off.\n' >&2
+    read -r _ || true
+    exec /bin/sh
+}
+
+# Prompts with $1; the answer goes in REPLY. An empty answer gives $2.
+ask() {
+    printf '%s' "$1"
+    read -r REPLY || REPLY=''
+    REPLY=${REPLY:-${2:-}}
+}
+
+ask_hidden() {
+    printf '%s' "$1"
+    stty -echo 2>/dev/null || true
+    read -r REPLY || REPLY=''
+    stty echo 2>/dev/null || true
+    printf '\n'
+}
+
+mount_stick() {
+    if ! grep -q " $STICK " /proc/mounts; then
+        mkdir -p "$STICK"
+        mount -t vfat LABEL=CAKIOUSB "$STICK" || fail 'the installer stick is not mounted'
+    fi
+    mount -o remount,rw "$STICK" || fail 'cannot write to the installer stick'
+    [ -f "$STICK/kiosk/cakio.apkovl.tar.gz" ] || fail "no kiosk system on the stick ($STICK/kiosk)"
+    [ -f "$STICK/kiosk/modloop-lts" ] || fail "no kernel modules image on the stick ($STICK/kiosk/modloop-lts)"
+    RELEASE=$(cat "$STICK/release.txt" 2>/dev/null || printf unknown)
+}
+
+# Reads the defaults kiosk-build.sh write stored on the stick, if any. The
+# values are taken verbatim after the "=" so a password may hold any character.
+read_defaults() {
+    _rd_file=$STICK/kiosk/defaults.conf
+    [ -f "$_rd_file" ] || return 0
+    DEF_USER=$(sed -n 's/^CAMERA_USER=//p' "$_rd_file" | head -n 1)
+    DEF_PASS=$(sed -n 's/^CAMERA_PASSWORD=//p' "$_rd_file" | head -n 1)
+    DEF_LAYOUT=$(sed -n 's/^DEFAULT_LAYOUT=//p' "$_rd_file" | head -n 1)
+    [ -n "$DEF_LAYOUT" ] && [ ! -f "$STICK/layouts/$DEF_LAYOUT" ] && DEF_LAYOUT=''
+    return 0
+}
+
+# Prints the whole-disk name that holds the mounted stick.
+stick_disk() {
+    _sd_dev=$(awk -v m="$STICK" '$2 == m { print $1 }' /proc/mounts | head -n 1)
+    _sd_dev=${_sd_dev##*/}
+    [ -n "$_sd_dev" ] || return 0
+    _sd_parent=$(readlink -f "/sys/class/block/$_sd_dev/..")
+    printf '%s\n' "${_sd_parent##*/}"
+}
+
+disk_model() {
+    for _dm_file in "/sys/block/$1/device/model" "/sys/block/$1/device/name"; do
+        if [ -r "$_dm_file" ]; then
+            tr -d '\n' <"$_dm_file" | sed 's/[[:space:]]*$//'
+            return 0
+        fi
+    done
+    printf 'unknown model'
+}
+
+disk_gb() {
+    awk -v s="$(cat "/sys/block/$1/size")" 'BEGIN { printf "%.1f", s * 512 / 1000000000 }'
+}
+
+# Picks the largest internal (non-removable) disk that is not the stick.
+find_internal_disk() {
+    _fi_stick=$(stick_disk)
+    _fi_best=''
+    _fi_best_size=0
+    for _fi_dir in /sys/block/*; do
+        _fi_name=${_fi_dir##*/}
+        case $_fi_name in
+            loop* | ram* | sr* | zram* | fd* | dm-* | md* | nbd*) continue ;;
+        esac
+        [ "$_fi_name" != "$_fi_stick" ] || continue
+        [ "$(cat "$_fi_dir/removable" 2>/dev/null)" = 0 ] || continue
+        _fi_size=$(cat "$_fi_dir/size" 2>/dev/null || printf 0)
+        [ "$_fi_size" -gt 0 ] || continue
+        if [ "$_fi_size" -gt "$_fi_best_size" ]; then
+            _fi_best=$_fi_name
+            _fi_best_size=$_fi_size
+        fi
+    done
+    [ -n "$_fi_best" ] || fail 'no internal disk found'
+    DISK=/dev/$_fi_best
+    case $_fi_best in
+        *[0-9]) PART=${DISK}p1 ;;
+        *) PART=${DISK}1 ;;
+    esac
+}
+
+existing_install() {
+    blkid 2>/dev/null | grep -q "^$DISK.*LABEL=\"CAKIO\""
+}
+
+valid_hostname() {
+    case $1 in
+        *[!a-z0-9-]* | -* | *- | '') return 1 ;;
+    esac
+    case $1 in
+        *-cakio-?*) ;;
+        *) return 1 ;;
+    esac
+    [ "${#1}" -le 63 ]
+}
+
+ask_hostname() {
+    while :; do
+        ask 'Hostname (whid-cakio-location, such as dty7-cakio-dock): '
+        if valid_hostname "$REPLY"; then
+            HOSTNAME_NEW=$REPLY
+            return 0
+        fi
+        say 'Use lowercase letters, digits, and hyphens, in the form whid-cakio-location.'
+    done
+}
+
+ask_layout() {
+    # The default comes from the stick when write chose one, else from the
+    # location part of the hostname.
+    _al_location=${HOSTNAME_NEW##*-cakio-}
+    _al_default=$DEF_LAYOUT
+    if [ -z "$_al_default" ] && [ -f "$STICK/layouts/$_al_location.conf" ]; then
+        _al_default=$_al_location.conf
+    fi
+
+    say ''
+    say 'Layouts on the stick:'
+    _al_n=0
+    for _al_file in "$STICK"/layouts/*.conf; do
+        [ -f "$_al_file" ] || continue
+        _al_n=$((_al_n + 1))
+        _al_cameras=$(grep -c '^[[:space:]]*[A-Za-z0-9_]*|' "$_al_file" || true)
+        printf '  %2d) %-28s %s cameras\n' "$_al_n" "${_al_file##*/}" "$_al_cameras"
+    done
+    say '   0) none (set it later over SSH)'
+
+    while :; do
+        if [ -n "$_al_default" ]; then
+            ask "Layout name or number [$_al_default]: " "$_al_default"
+        else
+            ask 'Layout name or number: '
+        fi
+        case $REPLY in
+            0 | none)
+                LAYOUT_FILE=''
+                return 0
+                ;;
+            *[!0-9]*)
+                if [ -f "$STICK/layouts/$REPLY" ]; then
+                    LAYOUT_FILE=$STICK/layouts/$REPLY
+                    return 0
+                fi
+                if [ -f "$STICK/layouts/$REPLY.conf" ]; then
+                    LAYOUT_FILE=$STICK/layouts/$REPLY.conf
+                    return 0
+                fi
+                ;;
+            *)
+                _al_i=0
+                for _al_file in "$STICK"/layouts/*.conf; do
+                    [ -f "$_al_file" ] || continue
+                    _al_i=$((_al_i + 1))
+                    if [ "$_al_i" -eq "$REPLY" ]; then
+                        LAYOUT_FILE=$_al_file
+                        return 0
+                    fi
+                done
+                ;;
+        esac
+        say 'No such layout.'
+    done
+}
+
+ask_credentials() {
+    say ''
+    say 'Camera credentials are stored on this unit.'
+    if [ -n "$DEF_USER" ]; then
+        say "The stick carries the credentials of camera user $DEF_USER. Press Enter"
+        say 'to use them, type another user, or type none to set them later over SSH.'
+        ask "Camera user [$DEF_USER]: " "$DEF_USER"
+    else
+        say 'Leave the user empty to set them later over SSH.'
+        ask 'Camera user: '
+    fi
+    case $REPLY in
+        '' | none)
+            CAM_USER=''
+            CAM_PASS=''
+            return 0
+            ;;
+    esac
+    CAM_USER=$REPLY
+    _ac_saved=''
+    [ "$CAM_USER" = "$DEF_USER" ] && _ac_saved=$DEF_PASS
+    while :; do
+        if [ -n "$_ac_saved" ]; then
+            ask_hidden 'Camera password (Enter = the one saved on the stick): '
+            if [ -z "$REPLY" ]; then
+                CAM_PASS=$_ac_saved
+                return 0
+            fi
+        else
+            ask_hidden 'Camera password: '
+            if [ -z "$REPLY" ]; then
+                say 'The password cannot be empty.'
+                continue
+            fi
+        fi
+        CAM_PASS=$REPLY
+        ask_hidden 'Camera password (again): '
+        [ "$REPLY" = "$CAM_PASS" ] && return 0
+        say 'The passwords did not match; try again.'
+    done
+}
+
+# Prints $1 as HH:MM when it is a valid 24-hour time; fails otherwise.
+normalize_time() {
+    case $1 in
+        [0-9]:[0-9][0-9]) set -- "0$1" ;;
+        [0-9][0-9]:[0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    _nt_h=${1%%:*}
+    _nt_m=${1##*:}
+    [ "$_nt_h" -le 23 ] && [ "$_nt_m" -le 59 ] || return 1
+    printf '%s\n' "$1"
+}
+
+ask_reboot_time() {
+    say ''
+    say 'The kiosk can restart itself once a day, which clears anything that'
+    say 'went wrong and applies staged updates. It is back on the cameras in'
+    say 'about a minute. Times are local time for the unit.'
+    while :; do
+        ask 'Daily reboot time, 24-hour HH:MM, or none [03:00]: ' 03:00
+        case $REPLY in
+            none | no | off)
+                REBOOT_TIME=''
+                return 0
+                ;;
+        esac
+        if REBOOT_TIME=$(normalize_time "$REPLY"); then
+            return 0
+        fi
+        say 'Use a time such as 03:00 or 23:30, or none.'
+    done
+}
+
+layout_name() {
+    if [ -n "$LAYOUT_FILE" ]; then
+        printf '%s\n' "${LAYOUT_FILE##*/}"
+    else
+        printf 'none\n'
+    fi
+}
+
+confirm() {
+    if [ -n "$CAM_USER" ]; then
+        _cf_cameras="user $CAM_USER"
+    else
+        _cf_cameras='credentials not set'
+    fi
+    say ''
+    say '================================================================'
+    say "  Install camera kiosk $RELEASE"
+    say "  Hostname:  $HOSTNAME_NEW"
+    say "  Layout:    $(layout_name)"
+    say "  Cameras:   $_cf_cameras"
+    say "  Reboot:    ${REBOOT_TIME:+daily at }${REBOOT_TIME:-never on its own}"
+    say "  Disk:      $DISK ($(disk_gb "${DISK##*/}") GB, $(disk_model "${DISK##*/}"))"
+    if existing_install; then
+        say '  This disk already holds a kiosk; it will be replaced.'
+    fi
+    say ''
+    say '  EVERYTHING ON THE INTERNAL DISK WILL BE ERASED.'
+    say '================================================================'
+    ask 'Type YES to continue, anything else to start over: '
+    [ "$REPLY" = YES ]
+}
+
+# Erases whatever partition tables and filesystems the disk held before (HP's
+# own system leaves several behind) so partitioning starts from a blank disk.
+wipe_disk() {
+    say "Erasing the old partitions on $DISK..."
+    # A previously installed kiosk disk was mounted at boot by Alpine's disk
+    # scan. Unmount in a loop over a list, not "| while read": fail inside
+    # a pipeline would only end a subshell and the script would carry on.
+    _wd_mounts=$(awk -v d="$DISK" 'index($1, d) == 1 { print $2 }' /proc/mounts)
+    for _wd_mnt in $_wd_mounts; do
+        umount "$_wd_mnt" ||
+            fail "cannot unmount $_wd_mnt from $DISK; something on the disk is still in use (a stick older than release 20261001-1844 loads its kernel modules from there)"
+    done
+    _wd_mb=$(($(cat "/sys/block/${DISK##*/}/size") / 2048))
+    [ "$_wd_mb" -gt 64 ] || fail "$DISK is too small ($_wd_mb MB)"
+    # The first MiBs hold the MBR, the GPT, and the start of the old first
+    # partition; the last MiB holds the GPT backup.
+    dd if=/dev/zero of="$DISK" bs=1M count=16 conv=fsync 2>/dev/null || fail "cannot erase the start of $DISK"
+    dd if=/dev/zero of="$DISK" bs=1M count=1 seek=$((_wd_mb - 1)) conv=fsync 2>/dev/null ||
+        fail "cannot erase the end of $DISK"
+    # Make the kernel forget the old partitions, and wait until their device
+    # files are gone. Otherwise the old first partition's file would still be
+    # there when the new table is written, and it would vanish and reappear
+    # under us while we format and mount it (that was the "cannot mount"
+    # failure on units that came with HP's system).
+    blockdev --rereadpt "$DISK" 2>/dev/null || true
+    _wd_waited=0
+    while [ -e "$PART" ] && [ "$_wd_waited" -lt 20 ]; do
+        sleep 0.5
+        _wd_waited=$((_wd_waited + 1))
+    done
+    [ ! -e "$PART" ] || rm -f "$PART"
+    sleep 1
+}
+
+partition_disk() {
+    say "Partitioning $DISK..."
+    sfdisk --quiet --force --wipe always --wipe-partitions always "$DISK" <<'EOF' || fail 'partitioning failed'
+label: gpt
+type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name=CAKIO
+EOF
+    # Wait for the kernel to show the new partition and for its device file.
+    _pd_sys=/sys/class/block/${PART##*/}
+    _pd_waited=0
+    while [ ! -d "$_pd_sys" ] || [ ! -b "$PART" ]; do
+        [ "$_pd_waited" -lt 40 ] || fail "$PART did not appear"
+        sleep 0.5
+        _pd_waited=$((_pd_waited + 1))
+        # The device manager creates the file; help it along if it is slow.
+        if [ -d "$_pd_sys" ] && [ ! -b "$PART" ] && [ "$_pd_waited" -ge 10 ]; then
+            mdev -s 2>/dev/null || true
+        fi
+    done
+    sleep 1
+    # Right after the table is written the device scanner may still hold the
+    # new partition open for a moment; try again rather than give up.
+    _pd_try=0
+    until mkfs.vfat -F 32 -n CAKIO "$PART" >/dev/null 2>/tmp/mkfs.err; do
+        _pd_try=$((_pd_try + 1))
+        [ "$_pd_try" -lt 10 ] || fail "formatting failed: $(cat /tmp/mkfs.err)"
+        sleep 1
+    done
+    mkdir -p "$TARGET"
+    _pd_try=0
+    until mount -t vfat "$PART" "$TARGET" 2>/tmp/mount.err; do
+        _pd_try=$((_pd_try + 1))
+        [ "$_pd_try" -lt 10 ] || fail "cannot mount $PART: $(cat /tmp/mount.err)"
+        sleep 1
+    done
+}
+
+copy_system() {
+    say 'Copying the boot files...'
+    cp -r "$STICK/boot" "$TARGET/" || fail 'copying boot files failed'
+    # The kiosk finds its kernel modules in boot/ by itself; the stick keeps
+    # them elsewhere so that the installer never mistakes a unit's copy for
+    # its own. The installer's own configuration is of no use to the kiosk.
+    cp "$STICK/kiosk/modloop-lts" "$TARGET/boot/modloop-lts" || fail 'copying the kernel modules failed'
+    rm -f "$TARGET/boot/cakio-installer.cpio.gz"
+    cp -r "$STICK/efi" "$TARGET/" || fail 'copying EFI files failed'
+    cp "$STICK/kiosk/grub.cfg" "$TARGET/boot/grub/grub.cfg" || fail 'copying grub.cfg failed'
+    say "Copying the packages ($(du -sm "$STICK/apks" | cut -f1) MB)..."
+    cp -r "$STICK/apks" "$TARGET/" || fail 'copying packages failed'
+    cp "$STICK/release.txt" "$TARGET/release.txt" 2>/dev/null || true
+}
+
+# Builds this unit's configuration from the base one plus its own settings.
+write_overlay() {
+    say 'Writing the configuration...'
+    rm -rf "$OVL"
+    mkdir -p "$OVL"
+    tar -xzf "$STICK/kiosk/cakio.apkovl.tar.gz" -C "$OVL" || fail 'cannot unpack the base configuration'
+
+    printf '%s\n' "$HOSTNAME_NEW" >"$OVL/etc/hostname"
+    mkdir -p "$OVL/etc/network"
+    cat >"$OVL/etc/network/interfaces" <<EOF
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet dhcp
+    udhcpc_opts -x hostname:$HOSTNAME_NEW
+EOF
+
+    mkdir -p "$OVL/etc/kiosk"
+    if [ -n "$LAYOUT_FILE" ]; then
+        cp "$LAYOUT_FILE" "$OVL/etc/kiosk/layout.conf"
+        chmod 644 "$OVL/etc/kiosk/layout.conf"
+    fi
+    if [ -n "$CAM_USER" ]; then
+        umask 077
+        printf 'CAMERA_USER=%s\nCAMERA_PASSWORD=%s\n' "$CAM_USER" "$CAM_PASS" >"$OVL/etc/kiosk/camera.env"
+        umask 022
+        chown 0:1000 "$OVL/etc/kiosk/camera.env"
+        chmod 0440 "$OVL/etc/kiosk/camera.env"
+    fi
+
+    # The daily reboot is one line in root's crontab, marked so kiosk-apply
+    # can change it later. The other lines are Alpine's periodic jobs.
+    mkdir -p "$OVL/etc/crontabs"
+    touch "$OVL/etc/crontabs/root"
+    sed -i '/# cakio daily reboot$/d' "$OVL/etc/crontabs/root"
+    if [ -n "$REBOOT_TIME" ]; then
+        _wo_h=${REBOOT_TIME%%:*}
+        _wo_m=${REBOOT_TIME##*:}
+        printf '%s %s * * * /usr/local/bin/kiosk-nightly # cakio daily reboot\n' \
+            "${_wo_m#0}" "${_wo_h#0}" >>"$OVL/etc/crontabs/root"
+    fi
+    chmod 600 "$OVL/etc/crontabs/root"
+
+    mkdir -p "$OVL/etc/ssh"
+    rm -f "$OVL"/etc/ssh/ssh_host_*
+    ssh-keygen -q -t ed25519 -N '' -C "$HOSTNAME_NEW" -f "$OVL/etc/ssh/ssh_host_ed25519_key" ||
+        fail 'cannot create the SSH host key'
+    chmod 600 "$OVL/etc/ssh/ssh_host_ed25519_key"
+
+    _wo_serial=$(tr -d ' \n' </sys/class/dmi/id/product_serial 2>/dev/null || true)
+    _wo_serial=${_wo_serial:-unknown}
+    _wo_mac=''
+    for _wo_dev in /sys/class/net/eth0 /sys/class/net/e*; do
+        if [ -r "$_wo_dev/address" ]; then
+            read -r _wo_mac <"$_wo_dev/address"
+            break
+        fi
+    done
+    _wo_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    cat >"$OVL/etc/kiosk/unit.conf" <<EOF
+serial=$_wo_serial
+mac=${_wo_mac:-unknown}
+release=$RELEASE
+provisioned=$_wo_date
+EOF
+
+    tar -czf "$TARGET/$HOSTNAME_NEW.apkovl.tar.gz" -C "$OVL" etc usr home ||
+        fail 'cannot write the configuration'
+    chmod 600 "$OVL/etc/ssh/ssh_host_ed25519_key"
+
+    FINGERPRINT=$(ssh-keygen -lf "$OVL/etc/ssh/ssh_host_ed25519_key.pub" | awk '{ print $2 }')
+    mkdir -p "$STICK/records"
+    cat >"$STICK/records/$HOSTNAME_NEW-$_wo_serial.txt" <<EOF
+hostname=$HOSTNAME_NEW
+serial=$_wo_serial
+mac=${_wo_mac:-unknown}
+fingerprint=$FINGERPRINT
+release=$RELEASE
+provisioned=$_wo_date
+layout=$(layout_name)
+reboot=${REBOOT_TIME:-none}
+EOF
+    rm -rf "$OVL"
+}
+
+finish() {
+    sync
+    umount "$TARGET" || fail "cannot unmount $TARGET"
+    mount -o remount,ro "$STICK" 2>/dev/null || true
+    say ''
+    say '================================================================'
+    say "  Installed $HOSTNAME_NEW"
+    say "  Host key: $FINGERPRINT"
+    say "  Record written to the stick: records/$HOSTNAME_NEW-*.txt"
+    say ''
+    say '  Remove the USB stick, then press Enter to power off.'
+    say '================================================================'
+    read -r _ || true
+    poweroff
+    sleep 60
+}
+
+main() {
+    clear 2>/dev/null || true
+    say '================================================================'
+    say '  Camera kiosk installer'
+    say '================================================================'
+    mount_stick
+    read_defaults
+    find_internal_disk
+    say "Release:       $RELEASE"
+    say "Internal disk: $DISK ($(disk_gb "${DISK##*/}") GB, $(disk_model "${DISK##*/}"))"
+    if existing_install; then
+        say 'This unit already has a kiosk installed.'
+    fi
+    say ''
+    while :; do
+        ask_hostname
+        ask_layout
+        ask_credentials
+        ask_reboot_time
+        confirm && break
+        say ''
+    done
+    wipe_disk
+    partition_disk
+    copy_system
+    write_overlay
+    finish
+}
+
+FINGERPRINT=''
+main

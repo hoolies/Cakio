@@ -1,0 +1,61 @@
+#!/usr/bin/env sh
+# kiosk-xsession - the X client of the camera kiosk.
+#
+# Shows the camera wall described by /etc/kiosk/layout.conf. While no layout
+# is installed, shows a screen with the hostname and address so the unit can
+# be enrolled over SSH. Exits when the camera wall stops, which makes
+# kiosk-session restart the whole X session.
+
+set -u
+
+readonly LAYOUT=/etc/kiosk/layout.conf
+readonly FONT=/usr/share/fonts/liberation/LiberationSans-Bold.ttf
+readonly RECHECK=15
+
+# Escapes text for a drawtext option inside a filter graph.
+escape_text() {
+    printf '%s' "$1" | sed 's/[\\:'"'"'[],;]/\\\\&/g'
+}
+
+address_of() {
+    ip -4 -o addr show scope global 2>/dev/null |
+        awk '{ sub("/.*", "", $4); print $4; exit }'
+}
+
+screen_size() {
+    _ss_mode=''
+    for _ss_dir in /sys/class/drm/card*-*; do
+        [ -r "$_ss_dir/status" ] || continue
+        read -r _ss_state <"$_ss_dir/status" || continue
+        [ "$_ss_state" = connected ] || continue
+        read -r _ss_mode <"$_ss_dir/modes" 2>/dev/null || _ss_mode=''
+        _ss_mode=${_ss_mode%%[!0-9x]*}
+        [ -n "$_ss_mode" ] && break
+    done
+    printf '%s\n' "${_ss_mode:-1920x1080}"
+}
+
+# Shows the "not enrolled" screen for RECHECK seconds.
+show_waiting_screen() {
+    _sw_size=$(screen_size)
+    _sw_h=${_sw_size#*x}
+    _sw_big=$((_sw_h / 22))
+    _sw_small=$((_sw_h / 40))
+    _sw_host=$(escape_text "$(hostname)")
+    _sw_addr=$(escape_text "${1:-no network address yet}")
+    _sw_graph="color=c=0x101820:s=$_sw_size:r=1"
+    _sw_graph="$_sw_graph,drawtext=fontfile=$FONT:expansion=none:text=No camera layout installed"
+    _sw_graph="$_sw_graph:fontsize=$_sw_big:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-$_sw_big"
+    _sw_graph="$_sw_graph,drawtext=fontfile=$FONT:expansion=none:text=$_sw_host"
+    _sw_graph="$_sw_graph:fontsize=$_sw_small:fontcolor=0x8a9099:x=(w-text_w)/2:y=(h-text_h)/2+$_sw_small"
+    _sw_graph="$_sw_graph,drawtext=fontfile=$FONT:expansion=none:text=$_sw_addr"
+    _sw_graph="$_sw_graph:fontsize=$_sw_small:fontcolor=0x8a9099:x=(w-text_w)/2:y=(h-text_h)/2+$((_sw_small * 3))"
+    timeout "$RECHECK" ffplay -hide_banner -loglevel error -fs -noborder -an -sn \
+        -f lavfi -i "$_sw_graph,format=yuv420p" >/dev/null 2>&1 || true
+}
+
+while [ ! -f "$LAYOUT" ]; do
+    show_waiting_screen "$(address_of)"
+done
+
+exec /usr/local/bin/kiosk-mosaic "$LAYOUT" 2>&1 | logger -t kiosk-mosaic

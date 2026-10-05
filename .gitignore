@@ -1,0 +1,16 @@
+# Certificate authority, inventory, and enrollment records (init-ca).
+# Private keys, trust list, and site inventory — never commit.
+/ca/
+
+# Stick images and the virtual disk used by "kiosk-build.sh boot".
+/cakio-*.img
+/cakio-test-disk.img
+*.img.build.log
+
+# Screenshots from "kiosk-admin.sh shot" and mosaic --snapshot previews.
+*.png
+
+# Editor and OS clutter.
+*~
+.*.swp
+.DS_Store

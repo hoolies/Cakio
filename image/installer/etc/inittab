@@ -1,0 +1,9 @@
+# /etc/inittab for the camera kiosk installer stick.
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+tty1::respawn:/usr/local/bin/kiosk-provision
+
+::ctrlaltdel:/sbin/reboot
+::shutdown:/sbin/openrc shutdown

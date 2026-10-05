@@ -1,0 +1,13 @@
+# /etc/inittab for the camera kiosk.
+#
+# The only console program is an automatic login of the kiosk user, whose
+# login shell is the camera wall. There is no other way in from the
+# keyboard: no other consoles, no Ctrl-Alt-Del.
+
+::sysinit:/sbin/openrc sysinit
+::sysinit:/sbin/openrc boot
+::wait:/sbin/openrc default
+
+tty1::respawn:/bin/login -f cakio
+
+::shutdown:/sbin/openrc shutdown

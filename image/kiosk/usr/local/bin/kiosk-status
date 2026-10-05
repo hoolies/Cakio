@@ -1,0 +1,114 @@
+#!/usr/bin/env sh
+# kiosk-status - report the state of this camera kiosk.
+#
+# Meant to be run as root over SSH (doas kiosk-status). Prints what a
+# support person needs to know without looking at the screen.
+
+set -u
+
+export LC_ALL=C
+
+readonly LAYOUT=/etc/kiosk/layout.conf
+readonly UNIT=/etc/kiosk/unit.conf
+
+usage() {
+    printf '%s\n' "Usage: kiosk-status [OPTION]...
+Report the state of this camera kiosk.
+
+  -h, --help    display this help and exit"
+}
+
+case ${1:-} in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    '') ;;
+    *)
+        printf 'kiosk-status: unrecognized option %s\n' "'$1'" >&2
+        printf "Try 'kiosk-status --help' for more information.\n" >&2
+        exit 2
+        ;;
+esac
+
+section() {
+    printf '\n== %s\n' "$1"
+}
+
+section 'Unit'
+printf 'hostname: %s\n' "$(hostname)"
+[ -r "$UNIT" ] && cat -- "$UNIT"
+printf 'uptime:  %s\n' "$(uptime)"
+awk '/MemTotal|MemAvailable/ { printf "%s %d MB\n", $1, $2 / 1024 }' /proc/meminfo
+printf 'root tmpfs: %s\n' "$(df -h / | awk 'NR == 2 { print $3 " used of " $2 }')"
+if [ -e /sys/block/zram0/disksize ]; then
+    printf 'zram swap: %s\n' "$(awk '/zram0/ { printf "%d MB used of %d MB", $4 / 1024, $3 / 1024; found = 1 } END { if (!found) print "not active" }' /proc/swaps)"
+fi
+printf 'time: %s\n' "$(date)"
+reboot_at=$(awk '/# cakio daily reboot$/ { printf "%02d:%02d", $2, $1; exit }' /etc/crontabs/root 2>/dev/null)
+printf 'daily reboot: %s (crond %s)\n' "${reboot_at:-none}" \
+    "$(pgrep -f '(^|/)crond( |$)' >/dev/null 2>&1 && printf running || printf 'not running')"
+
+section 'Network'
+for dir in /sys/class/net/*; do
+    name=${dir##*/}
+    [ "$name" != lo ] || continue
+    [ -e "$dir/device" ] || continue
+    printf '%s: carrier=%s mac=%s\n' "$name" "$(cat "$dir/carrier" 2>/dev/null || printf '?')" "$(cat "$dir/address")"
+done
+ip -4 -o addr show scope global 2>/dev/null | awk '{ print $2 ": " $4 }'
+ip route show default 2>/dev/null
+
+section 'Layout'
+if [ -f "$LAYOUT" ]; then
+    grep -v '^[[:space:]]*#' -- "$LAYOUT" | grep -v '^[[:space:]]*$'
+else
+    printf 'no layout installed\n'
+fi
+
+section 'Camera wall'
+# busybox pgrep matches program paths, so match on the command line instead.
+if pgrep -f 'kiosk-mosaic /etc' >/dev/null 2>&1; then
+    printf 'kiosk-mosaic: running\n'
+    status_dir=$(find /tmp -maxdepth 1 -name 'kiosk-mosaic.*' -user cakio 2>/dev/null | head -n 1)
+    if [ -n "$status_dir" ] && [ -f "$LAYOUT" ]; then
+        kiosk-mosaic --print --interface none --hwdec none "$LAYOUT" 2>/dev/null |
+            awk -v dir="$status_dir" '
+                BEGIN { n = 0 }
+                /^# [A-Za-z0-9_]+ +/ && !/^# mosaic|^# decoding|^# tile|^# shown/ {
+                    file = dir "/t" n ".txt"
+                    status = "live"
+                    if ((getline line < file) > 0 && line != "")
+                        status = line
+                    close(file)
+                    printf "  %-3s %-6s %-36s %s\n", $2, $3, substr($0, 14, 36), status
+                    n++
+                }'
+        if [ -f "$status_dir/message.txt" ] && pgrep -f 'kiosk-mosaic message' >/dev/null 2>&1; then
+            printf 'screen message: %s %s\n' "$(cat "$status_dir/message.txt")" "$(cat "$status_dir/message.txt2" 2>/dev/null)"
+        fi
+    fi
+else
+    printf 'kiosk-mosaic: not running\n'
+fi
+printf 'X server: %s\n' "$(pgrep -f '(^|/)Xorg( |$)' >/dev/null 2>&1 && printf running || printf 'not running')"
+for xlog in /home/cakio/.local/share/xorg/Xorg.0.log /var/log/Xorg.0.log; do
+    # Input driver complaints are expected: the kiosk has no input devices.
+    # The log legend line also contains "(EE)".
+    if [ -f "$xlog" ] && grep '(EE)' "$xlog" | grep -qv 'input driver\|module does not exist\|(WW) warning'; then
+        printf 'X server errors (%s):\n' "$xlog"
+        grep '(EE)' "$xlog" | grep -v 'input driver\|module does not exist\|(WW) warning' | tail -n 5
+        break
+    fi
+done
+if [ -s /var/log/kiosk/session.log ] && grep -qv '^pci id for fd' /var/log/kiosk/session.log; then
+    printf 'session log:\n'
+    grep -v '^pci id for fd' /var/log/kiosk/session.log | tail -n 5
+fi
+printf 'ffmpeg processes: %s, ffplay processes: %s\n' "$(pgrep -f '(^|/)ffmpeg ' | wc -l)" "$(pgrep -f '(^|/)ffplay ' | wc -l)"
+if command -v vainfo >/dev/null 2>&1; then
+    printf 'GPU decoding: %s\n' "$(vainfo --display drm --device /dev/dri/renderD128 2>/dev/null | grep -c 'VAProfileH264\|VAProfileHEVC' | sed 's/^0$/not available/; s/^[1-9].*/available/')"
+fi
+
+section 'Recent log'
+grep -h 'kiosk-mosaic\|kiosk-session\|sshd' /var/log/messages 2>/dev/null | tail -n 25

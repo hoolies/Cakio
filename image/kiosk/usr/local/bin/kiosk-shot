@@ -1,0 +1,35 @@
+#!/usr/bin/env sh
+# kiosk-shot - save what is on the kiosk screen right now as a PNG.
+#
+# Run as root (doas kiosk-shot FILE). Prints the file name when done.
+
+set -eu
+
+usage() {
+    printf '%s\n' "Usage: kiosk-shot [FILE]
+Save a screenshot of the kiosk display to FILE (default /tmp/kiosk-shot.png).
+
+  -h, --help    display this help and exit"
+}
+
+case ${1:-} in
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    -*)
+        printf 'kiosk-shot: unrecognized option %s\n' "'$1'" >&2
+        printf "Try 'kiosk-shot --help' for more information.\n" >&2
+        exit 2
+        ;;
+esac
+
+out=${1:-/tmp/kiosk-shot.png}
+[ -S /tmp/.X11-unix/X0 ] || {
+    printf 'kiosk-shot: the X server is not running\n' >&2
+    exit 1
+}
+
+DISPLAY=:0 ffmpeg -hide_banner -nostdin -loglevel error -f x11grab -i :0 \
+    -frames:v 1 -update 1 -y "$out"
+printf '%s\n' "$out"

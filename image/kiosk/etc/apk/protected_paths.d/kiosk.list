@@ -1,0 +1,4 @@
+# Paths outside /etc that lbu commit must keep.
++usr/local/bin
++home/cakio
++home/kioskadm

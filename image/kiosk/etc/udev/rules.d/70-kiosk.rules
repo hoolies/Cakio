@@ -1,0 +1,3 @@
+# The kiosk user runs X and the video decoders without root.
+SUBSYSTEM=="drm", KERNEL=="card*", GROUP="video", MODE="0660"
+SUBSYSTEM=="drm", KERNEL=="renderD*", GROUP="video", MODE="0660"

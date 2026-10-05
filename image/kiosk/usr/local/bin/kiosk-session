@@ -1,0 +1,30 @@
+#!/usr/bin/env sh
+# kiosk-session - login shell of the kiosk user.
+#
+# Started by the automatic login on tty1. Runs the X server with the camera
+# wall as its only client, and starts it again whenever it stops. Never
+# returns to a shell prompt.
+
+set -u
+
+readonly LOG_DIR=/var/log/kiosk
+readonly XSESSION=/usr/local/bin/kiosk-xsession
+readonly XSERVER=/usr/bin/Xorg
+
+# login gives a minimal PATH without /usr/local/bin.
+PATH=/usr/local/bin:/usr/bin:/bin
+export PATH
+
+cd "${HOME:-/home/cakio}" 2>/dev/null || cd /
+mkdir -p -- "$LOG_DIR" 2>/dev/null || true
+
+logger -t kiosk-session 'session started'
+
+while :; do
+    # -keeptty: a server run by a normal user must keep this console. The X
+    # log goes to ~/.local/share/xorg/Xorg.0.log.
+    xinit "$XSESSION" -- "$XSERVER" :0 vt1 -keeptty -nocursor -nolisten tcp -s 0 -dpms \
+        -quiet >"$LOG_DIR/session.log" 2>&1
+    logger -t kiosk-session "X session ended with status $?; starting again"
+    sleep 3
+done

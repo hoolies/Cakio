@@ -1,0 +1,4 @@
+alpine-base
+dosfstools
+openssh-keygen
+sfdisk
