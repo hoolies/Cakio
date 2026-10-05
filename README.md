@@ -1,20 +1,20 @@
 # Cakio: the camera kiosk
 
-Cakio turns an HP t640 thin client into a screen that shows security cameras
+Cakio turns a Thin Client (TC) into a screen that shows security cameras
 and nothing else. You plug it in, it shows the cameras. Pull the power, it
 comes back on its own. Nobody can do anything with the keyboard. You manage
 it from your computer over SSH.
 
 This guide explains how it works, how to set it up, and what to do when
 something looks wrong. You do not need to know Linux to use it, but you will
-type a few commands in a terminal on your Ubuntu computer.
+type a few commands in a terminal on your Linux computer.
 
 ---
 
 ## The one-minute version
 
 1. **Once:** create your keys (`init-ca`) and build the installer stick.
-2. **Per kiosk:** boot the t640 from the stick, answer four questions, pull
+2. **Per kiosk:** boot the TC from the stick, answer four questions, pull
    the stick.
 3. **Per kiosk, from your desk:** `enroll` it. From then on you can change
    its cameras, check on it, and take screenshots over SSH.
@@ -75,13 +75,12 @@ over SSH with `kiosk-admin.sh`; it saves them for you.
 
 ## What you need
 
-- An Ubuntu computer (your workstation) with a terminal.
+- An Linux terminal.
 - Internet access from that computer, for the build.
 - A USB stick of 2 GB or more. The build erases it.
-- VPN access to the site, to reach the kiosks over SSH.
-- The camera user name and password.
+- VPN or physical access to the site, to reach the kiosks over SSH.
+- The camera's account (username and password).
 - DHCP reservations for the kiosks, so each one keeps the same address.
-  The MAC address is printed on the t640's label.
 
 Install the two tools the build needs (once):
 
@@ -231,7 +230,7 @@ Options you may want:
 
 ---
 
-## Step 3: Image a thin client (on site)
+## Step 3: Image a thin client
 
 Do this once per unit. It takes about five minutes.
 
@@ -282,9 +281,9 @@ Save and exit.
    stick. It ends with:
 
    ```
-   Installed dty7-cakio-dock
-   Host key: SHA256:UbXLddLubJAGMo3oQvdJ9akMg//D/wkM+FHQ9gN4U6A
-   Record written to the stick: records/dty7-cakio-dock-*.txt
+   Installed hostname
+   Host key: SHA256: <redacted>
+   Record written to the stick: records/hostname-*.txt
 
    Remove the USB stick, then press Enter to power off.
    ```
@@ -303,7 +302,7 @@ into `ca/records`. Enrollment uses it to recognise the units you imaged.
 
 ## Step 4: Enroll the kiosk (from your desk)
 
-Connect to the VPN. Sign your key for the day:
+Connect to the VPN, or to the VLAN if you are physically on site. Sign your key for the day:
 
 ```
 ./kiosk-admin.sh login
@@ -320,7 +319,7 @@ What happens, in order:
 1. It fetches the kiosk's host key and checks it against the records from
    the stick. If the record is missing, it refuses. You can then pass the
    fingerprint from the installer's final screen:
-   `--fingerprint SHA256:UbXLddLubJAGMo3oQvdJ9akMg//D/wkM+FHQ9gN4U6A`
+   `--fingerprint SHA256: <redacted>`
 2. It sets the kiosk's clock from your computer.
 3. It asks for the camera user and password unless the kiosk already has
    them (press Enter to keep those), or you pass `--no-creds`.
@@ -334,7 +333,7 @@ You can also set things during enrollment:
 
 ```
 ./kiosk-admin.sh enroll 10.20.30.40 layouts/default.conf       # install a layout
-./kiosk-admin.sh --hostname dty7-cakio-dock enroll 10.20.30.40 # rename
+./kiosk-admin.sh --hostname site-cakio-location enroll 10.20.30.40 # rename
 ```
 
 ---
@@ -606,7 +605,7 @@ only thing that survives, so a unit can never drift into an unknown state.
 ## Status and known limits
 
 - Tested end to end in a virtual machine: build, install, boot, enroll,
-  status, screenshot. The first real t640 is the hardware test; the GPU and
+  status, screenshot. The first real TC is the hardware test; the GPU and
   network firmware it needs is present in the image.
 - Updating the software on an enrolled kiosk currently means re-imaging it
   from a new stick and re-entering its settings. An `update` command that
