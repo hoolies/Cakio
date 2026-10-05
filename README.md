@@ -463,10 +463,10 @@ C D
 end
 
 # tile|camera number|name|address
-A|1001|Entrance|10.0.136.11
-B|1002|Yard|10.0.136.12
-C|1003|Parking|10.0.136.13
-D|1004|Dock|10.0.136.14
+A|1001|Entrance|10.20.30.41
+B|1002|Yard|10.20.30.42
+C|1003|Parking|10.20.30.43
+D|1004|Dock|10.20.30.44
 ```
 
 Each tile shows its label in the bottom-left corner: the number, a dash,
