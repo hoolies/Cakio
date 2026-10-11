@@ -27,6 +27,8 @@ readonly DEFAULT_SIZE_GB=2
 readonly DEFAULT_MEMORY_MB=2048
 readonly DEFAULT_TEST_DISK_GB=16
 readonly ALPINE_KEY_URL=https://alpinelinux.org/keys/ncopa.asc
+# Published at https://alpinelinux.org/downloads/ (Natanael Copa).
+readonly ALPINE_RELEASE_FPR=0482D84022F52DF1C4E7CD43293ACD0907D9495A
 readonly BUILD_TIMEOUT=5400
 readonly OVMF_CANDIDATES='/usr/share/ovmf/OVMF.fd
 /usr/share/qemu/OVMF.fd
@@ -265,6 +267,8 @@ check_ca() {
             die 'cannot derive the signing public key'
     fi
     [ -f "$CA_DIR/cakio-build.rsa.pub" ] || die "$CA_DIR/cakio-build.rsa.pub is missing"
+    chmod 700 "$CA_DIR" || die "cannot restrict $CA_DIR"
+    chmod 600 "$CA_DIR/cakio-build.rsa" || die "cannot restrict $CA_DIR/cakio-build.rsa"
 }
 
 # Downloads $1 to $2 unless $2 exists; fails on any HTTP error.
@@ -406,6 +410,10 @@ verify_iso_signature() {
     fi
     _vs_ring=$(mktemp "${TMPDIR:-/tmp}/cakio-ring.XXXXXX")
     TMP_FILES="$TMP_FILES $_vs_ring $_vs_ring~"
+    _vs_fpr=$(gpg --batch --with-colons --show-keys "$_vs_key" 2>/dev/null |
+        awk -F: '$1 == "fpr" { print $10; exit }')
+    [ "$_vs_fpr" = "$ALPINE_RELEASE_FPR" ] ||
+        die "$_vs_key is not the Alpine release key ($ALPINE_RELEASE_FPR); delete it and build again"
     gpg --quiet --batch --no-default-keyring --keyring "$_vs_ring" \
         --import "$_vs_key" 2>/dev/null ||
         die 'cannot import the Alpine release key'

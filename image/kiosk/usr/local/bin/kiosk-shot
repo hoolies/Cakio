@@ -25,6 +25,7 @@ case ${1:-} in
 esac
 
 out=${1:-/tmp/kiosk-shot.png}
+umask 077
 [ -S /tmp/.X11-unix/X0 ] || {
     printf 'kiosk-shot: the X server is not running\n' >&2
     exit 1

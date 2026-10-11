@@ -5,9 +5,12 @@
 # players, memory back to zero) and applies anything staged on the disk for
 # the next boot. The wall is back in about a minute.
 
-set -u
+set -eu
 
 export LC_ALL=C
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+hash -r
 
 readonly PROGNAME=kiosk-nightly
 
@@ -36,6 +39,17 @@ esac
     exit 1
 }
 
+if ! grep -q ' /media/cakio ' /proc/mounts; then
+    mount /media/cakio 2>/dev/null || true
+fi
+if [ -f /media/cakio/.update/READY ]; then
+    logger -t "$PROGNAME" "applying staged update $(cat /media/cakio/.update/READY)"
+    if kiosk-apply apply-update; then
+        logger -t "$PROGNAME" 'staged update installed'
+    else
+        logger -t "$PROGNAME" 'staged update failed; rebooting the current release'
+    fi
+fi
 logger -t "$PROGNAME" "daily reboot ($(uptime))"
 sync
 sleep 2

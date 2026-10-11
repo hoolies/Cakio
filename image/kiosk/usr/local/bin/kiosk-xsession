@@ -43,6 +43,13 @@ show_waiting_screen() {
     _sw_small=$((_sw_h / 40))
     _sw_host=$(escape_text "$(hostname)")
     _sw_addr=$(escape_text "${1:-no network address yet}")
+    _sw_when=$(date '+%Y-%m-%d %H:%M')
+    _sw_year=${_sw_when%%-*}
+    case $_sw_year in
+        202[4-9] | 203[0-6]) ;;
+        *) _sw_when="$_sw_when  clock looks wrong" ;;
+    esac
+    _sw_when=$(escape_text "$_sw_when")
     _sw_graph="color=c=0x101820:s=$_sw_size:r=1"
     _sw_graph="$_sw_graph,drawtext=fontfile=$FONT:expansion=none:text=No camera layout installed"
     _sw_graph="$_sw_graph:fontsize=$_sw_big:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2-$_sw_big"
@@ -50,6 +57,8 @@ show_waiting_screen() {
     _sw_graph="$_sw_graph:fontsize=$_sw_small:fontcolor=0x8a9099:x=(w-text_w)/2:y=(h-text_h)/2+$_sw_small"
     _sw_graph="$_sw_graph,drawtext=fontfile=$FONT:expansion=none:text=$_sw_addr"
     _sw_graph="$_sw_graph:fontsize=$_sw_small:fontcolor=0x8a9099:x=(w-text_w)/2:y=(h-text_h)/2+$((_sw_small * 3))"
+    _sw_graph="$_sw_graph,drawtext=fontfile=$FONT:expansion=none:text=$_sw_when"
+    _sw_graph="$_sw_graph:fontsize=$_sw_small:fontcolor=0x8a9099:x=(w-text_w)/2:y=(h-text_h)/2+$((_sw_small * 5))"
     timeout "$RECHECK" ffplay -hide_banner -loglevel error -fs -noborder -an -sn \
         -f lavfi -i "$_sw_graph,format=yuv420p" >/dev/null 2>&1 || true
 }

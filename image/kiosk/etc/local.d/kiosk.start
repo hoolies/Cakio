@@ -32,4 +32,10 @@ else
     logger -t kiosk 'zram module not available; running without swap'
 fi
 
+# The new kernel leaves a flag so the next boot can fall back. Reaching
+# here means this kernel started; a boot of the previous kernel does not.
+if ! /usr/local/bin/kiosk-apply confirm-boot; then
+    logger -t kiosk 'this kernel started, but the boot menu flag could not be cleared'
+fi
+
 exit 0

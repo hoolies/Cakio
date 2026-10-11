@@ -1,0 +1,10 @@
+# lbu commit only reads this filename, and only keeps /etc on its own.
+# A directory line is ignored (lbu does not recurse it); name each file.
+# Homes are recreated at boot by kiosk.start, so they are not listed.
++usr/local/bin/kiosk-apply
++usr/local/bin/kiosk-mosaic
++usr/local/bin/kiosk-nightly
++usr/local/bin/kiosk-session
++usr/local/bin/kiosk-shot
++usr/local/bin/kiosk-status
++usr/local/bin/kiosk-xsession

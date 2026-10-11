@@ -157,14 +157,44 @@ menuentry "Install the camera kiosk (erases the internal disk after you confirm)
 EOF
 
     cat >"$OUT/kiosk/grub.cfg" <<'EOF'
-set timeout=0
 set default=0
+set timeout=0
 search --no-floppy --set=root --label CAKIO
 
+# update-pending exists from apply-update until this kernel has started.
+# The first such boot tries the new kernel and waits 10 seconds. Choosing
+# either entry records the attempt. If this kernel never starts, the next
+# boot defaults to the previous one and waits again so the new one can be
+# retried. After a start, the flag is gone and later boots do not wait.
+if [ -f /boot.prev/vmlinuz-lts ] && [ -f /boot/update-pending ]; then
+    set timeout=10
+    if [ -f /boot/grub/grubenv ]; then
+        load_env -f /boot/grub/grubenv
+    fi
+    if [ "$tried" = 1 ]; then
+        set default=1
+    fi
+fi
+
 menuentry "Camera kiosk" {
-    linux /boot/vmlinuz-lts modules=loop,squashfs,sd-mod,mmc_block,nvme quiet vt.global_cursor_default=0 autodetect_serial=no
+    if [ -f /boot/update-pending ]; then
+        set tried=1
+        save_env -f /boot/grub/grubenv tried
+    fi
+    linux /boot/vmlinuz-lts modules=loop,squashfs,sd-mod,mmc_block,nvme quiet vt.global_cursor_default=0 autodetect_serial=no modloop=/boot/modloop-lts cakio-slot=current
     initrd /boot/initramfs-lts
 }
+
+if [ -f /boot.prev/vmlinuz-lts ]; then
+    menuentry "Previous release" {
+        if [ -f /boot/update-pending ]; then
+            set tried=1
+            save_env -f /boot/grub/grubenv tried
+        fi
+        linux /boot.prev/vmlinuz-lts modules=loop,squashfs,sd-mod,mmc_block,nvme quiet vt.global_cursor_default=0 autodetect_serial=no modloop=/boot.prev/modloop-lts cakio-slot=previous
+        initrd /boot.prev/initramfs-lts
+    }
+fi
 EOF
 }
 

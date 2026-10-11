@@ -134,10 +134,16 @@ You also need a personal SSH key. If `~/.ssh/id_ed25519` does not exist:
 ssh-keygen -t ed25519
 ```
 
-Each engineer who will manage kiosks needs their own SSH key and a copy of
-the `ca` folder, or you can sign their public key for them:
-`./kiosk-admin.sh --key /path/to/their_key login` (the signed certificate
-appears next to the key; give it back to them).
+Each engineer who will manage kiosks needs their own SSH key. Sign it from
+the one computer that holds the CA, and give them only the certificate:
+
+```
+./kiosk-admin.sh --key /path/to/their_key login
+```
+
+The signed certificate appears next to their key. Do not copy `user_ca`,
+`host_ca`, or `cakio-build.rsa` onto their computer. Those three files are
+the keys to every kiosk.
 
 ---
 
@@ -423,13 +429,42 @@ current time and whether the scheduler is running.
 
 ### Update the software on a kiosk
 
-Not yet, and not by itself. A kiosk's only source of packages is its own
-internal disk, by design: it never reaches out to the internet for
-software, so a nightly "apply all updates" job would have nothing to apply
-and a bad update could never take a wall down at 3 in the morning.
-Updates will come as a `kiosk-admin.sh update` command that pushes a new
-release over SSH and lets the nightly reboot switch to it. Until then, a
-new release means booting the unit from a new stick.
+Build a new stick image, then push it. The kiosk checks the signature
+against the key that was baked in when it was imaged, keeps the hostname,
+layout, camera password, and SSH host key, and switches at the next daily
+reboot:
+
+```
+./kiosk-build.sh
+./kiosk-admin.sh update 10.20.30.40
+./kiosk-admin.sh --now update 10.20.30.40    # install and reboot now
+```
+
+`status` shows a staged release until that reboot, and writes the release
+the unit is actually running into `ca/inventory.csv`. `--now` writes the
+release it is about to boot. A unit that took the update at its daily
+reboot picks up the new release in the inventory the next time you ask
+for `status`.
+
+If the new release boots but misbehaves and SSH still answers,
+`./kiosk-admin.sh rollback 10.20.30.40` puts the previous boot files,
+configuration, and release name back, then reboots. That can be done once.
+There is no second previous release; going further back means re-imaging
+from the stick.
+
+If the new release does not boot, the next power-on defaults to
+**Previous release** and waits 10 seconds, so you can still retry the new
+one. The first reboot after an update still tries the new kernel, and
+waits those same 10 seconds in case you want the previous one immediately.
+Once the new kernel has started, later boots do not show the menu. Booting
+the previous release on purpose keeps it as the default until the new
+kernel starts or you roll back.
+
+A unit imaged before this command existed still needs one stick install;
+after that, updates go over SSH. The first image that contains `openssl`
+is the one that can verify a later upload. The signing key on the unit
+is the one from that image. Replacing `cakio-build.rsa` does not take
+effect over SSH; build a stick with the new key and re-image the unit.
 
 ### Re-image or replace a unit
 
@@ -593,8 +628,15 @@ only thing that survives, so a unit can never drift into an unknown state.
   view, and set the BIOS administrator password, which prevents booting
   anything else on the unit.
 - Everything in `ca/` is sensitive: `user_ca` and `host_ca` are the ID-card
-  printers, `cakio-build.rsa` signs the software on the stick. Keep the
-  folder on an encrypted disk and back it up the same way.
+  printers, `cakio-build.rsa` signs the software on the stick and every
+  update. Keep the folder on an encrypted disk, on one computer, and back
+  it up the same way. `kiosk-admin.sh` sets those files to mode 600 and
+  refuses to run if it cannot. Give other engineers a signed SSH certificate,
+  not a copy of the private keys. The host certificates last 10 years and
+  there is no revocation list, so the host CA is the master key for every
+  unit. The public half of `cakio-build.rsa` is copied onto each unit at
+  imaging and is what that unit trusts for later updates. A new signing
+  key reaches a unit only by re-imaging it from a stick.
 - A stick written with camera credentials holds the camera password in
   plain text (`kiosk/defaults.conf`), and whoever has any stick can image a
   unit. Keep sticks with the keys, and rewrite one with an empty camera user
@@ -605,12 +647,23 @@ only thing that survives, so a unit can never drift into an unknown state.
 ## Status and known limits
 
 - Tested end to end in a virtual machine: build, install, boot, enroll,
-  status, screenshot. The first real TC is the hardware test; the GPU and
-  network firmware it needs is present in the image.
-- Updating the software on an enrolled kiosk currently means re-imaging it
-  from a new stick and re-entering its settings. An `update` command that
-  does this over SSH while keeping the settings is the planned next step;
-  the daily reboot is already the moment such an update would take effect.
+  status, screenshot. On the first real thin client, confirm each of these
+  before imaging the rest of the site:
+  - BIOS administrator password, Secure Boot off, power on after power loss.
+  - USB boot for imaging, then the internal disk first.
+  - Both display outputs, and the picture filling the screen.
+  - `status` shows `GPU decoding: available` and `clock` as synchronised,
+    with this year's date. A dead clock battery plus a VLAN that blocks NTP
+    (UDP 123 to `pool.ntp.org`) will reject the SSH certificate.
+  - The interface name stays `eth0`.
+  - Unplug the cable, and unplug one camera: the messages in the table above
+    appear, and the other tiles stay up.
+  - `shot` saves a PNG, and the daily reboot comes back to the cameras.
+- `./kiosk-admin.sh update` pushes a signed release over SSH. The daily
+  reboot is when it takes effect. Layout, camera credentials, and the host
+  key are kept. The first reboot after an update waits 10 seconds. If that
+  kernel does not start, the next boot defaults to the previous release.
+  `rollback` returns to that release once, and only while SSH still answers.
 - Memory: the whole system runs from RAM, with a compressed swap area in
   RAM (zram, half the memory) as a safety net for busy walls. `status`
   shows how much of it is in use; a value that keeps growing on a unit is
@@ -632,11 +685,16 @@ kiosk-admin.sh [options] command
   layout HOST FILE           install a new layout and save
   creds HOST...              set the camera credentials and save
   reboot-time HOST TIME      daily restart at TIME (HH:MM) or none, and save
-  status HOST                what the kiosk is doing
+  status HOST                what the kiosk is doing; records the running
+                               release in the inventory
   shot HOST [FILE]           screenshot of the kiosk screen
   ssh HOST [COMMAND...]      shell or command on the kiosk
+  update HOST [IMAGE]        stage a signed release; the next daily reboot
+                               installs it (--now installs and reboots)
+  rollback HOST              restore the previous release and reboot (once)
   options: -c/--ca-dir DIR, -p/--port N, -i/--key FILE, --records DIR,
-           --fingerprint SHA256:..., --hostname NAME, --no-creds, --hours N
+           --fingerprint SHA256:..., --hostname NAME, --no-creds, --hours N,
+           --now
 
 kiosk-build.sh [options] command
   image (default)            build the stick image

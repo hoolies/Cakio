@@ -1657,6 +1657,9 @@ tile_supervisor() {
             sleep 1
             if [ -z "$_ts_live" ] && [ $(($(date +%s) - _ts_started)) -ge "$LIVE_AFTER" ]; then
                 _ts_live=1
+                # An empty file is "live". Leave the failure text in place until then,
+                # or status keeps reporting the camera down after the picture is back.
+                write_text "$_ts_status" ''
                 if [ -n "$_ts_down" ]; then
                     info "tile $TILE_TOK ($TILE_LABEL): camera is back"
                     _ts_down=''

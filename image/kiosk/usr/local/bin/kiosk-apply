@@ -17,8 +17,13 @@ readonly HOST_KEY=/etc/ssh/ssh_host_ed25519_key
 readonly HOST_CERT=/etc/ssh/ssh_host_ed25519_key-cert.pub
 readonly HOST_CERT_CONF=/etc/ssh/sshd_config.d/10-hostcert.conf
 readonly MEDIA=/media/cakio
+readonly UPDATE_DIR=$MEDIA/.update
+readonly PREV_DIR=$MEDIA/.prev
 readonly CRONTAB=/etc/crontabs/root
 readonly CRON_MARK='# cakio daily reboot'
+readonly UPDATE_MARK=/run/cakio-update-applied
+BUILD_PUB=${KIOSK_BUILD_PUB:-/etc/apk/keys/cakio-build.rsa.pub}
+readonly BUILD_PUB
 
 usage() {
     printf '%s\n' "Usage: $PROGNAME COMMAND [ARG]...
@@ -36,6 +41,13 @@ Commands:
   restart           start the camera wall again
   commit            save the configuration to the internal disk
   show              print the current settings (without the password)
+  stage-update      verify an update bundle on standard input and stage it
+  apply-update      install a staged update (boot files and programs);
+                      keeps hostname, layout, camera credentials, and host key
+  rollback-update   put back the boot files and configuration from before
+                      the last apply-update; this can be done once
+  confirm-boot      clear the one-time boot menu wait after this kernel
+                      has started
 
   -h, --help        display this help and exit"
 }
@@ -171,9 +183,24 @@ cmd_reboot_time() {
     fi
 }
 
+# Puts back the host certificate from before cmd_hostcert changed it.
+restore_hostcert() {
+    rm -f -- "$HOST_CERT" "$HOST_CERT_CONF"
+    if [ -n "${_ch_old_cert:-}" ] && [ -f "$_ch_old_cert" ]; then
+        mv -f -- "$_ch_old_cert" "$HOST_CERT"
+    fi
+    if [ -n "${_ch_old_conf:-}" ] && [ -f "$_ch_old_conf" ]; then
+        mv -f -- "$_ch_old_conf" "$HOST_CERT_CONF"
+    fi
+    _ch_old_cert=''
+    _ch_old_conf=''
+}
+
 cmd_hostcert() {
     [ $# -eq 0 ] || usage_error 'hostcert takes no arguments; give the certificate on standard input'
     _ch_tmp=$(mktemp /tmp/hostcert.XXXXXX)
+    _ch_old_cert=''
+    _ch_old_conf=''
     cat >"$_ch_tmp"
     ssh-keygen -L -f "$_ch_tmp" >/dev/null 2>&1 || {
         rm -f -- "$_ch_tmp"
@@ -185,12 +212,34 @@ cmd_hostcert() {
         rm -f -- "$_ch_tmp"
         die 'the certificate is for a different host key'
     }
+    if [ -f "$HOST_CERT" ]; then
+        _ch_old_cert=$(mktemp /tmp/hostcert-old.XXXXXX)
+        cp -a -- "$HOST_CERT" "$_ch_old_cert"
+    fi
+    if [ -f "$HOST_CERT_CONF" ]; then
+        _ch_old_conf=$(mktemp /tmp/hostcert-conf.XXXXXX)
+        cp -a -- "$HOST_CERT_CONF" "$_ch_old_conf"
+    fi
     chmod 644 "$_ch_tmp"
     mv -f -- "$_ch_tmp" "$HOST_CERT"
     mkdir -p "${HOST_CERT_CONF%/*}"
     printf 'HostCertificate %s\n' "$HOST_CERT" >"$HOST_CERT_CONF"
-    sshd -t || die 'sshd rejected the new configuration; certificate removed'
-    rc-service sshd restart >/dev/null 2>&1 || die 'sshd did not restart'
+    _ch_err=$(mktemp /tmp/sshd-test.XXXXXX)
+    if ! sshd -t >"$_ch_err" 2>&1; then
+        cat "$_ch_err" >&2
+        rm -f -- "$_ch_err"
+        restore_hostcert
+        die 'sshd rejected the new configuration; the previous host certificate is still in place'
+    fi
+    rm -f -- "$_ch_err"
+    if ! rc-service sshd restart >/dev/null 2>&1; then
+        restore_hostcert
+        rc-service sshd start >/dev/null 2>&1 || true
+        die 'sshd did not restart; the previous host certificate was restored'
+    fi
+    rm -f -- "$_ch_old_cert" "$_ch_old_conf"
+    _ch_old_cert=''
+    _ch_old_conf=''
     printf 'host certificate installed\n'
 }
 
@@ -206,17 +255,40 @@ cmd_clock() {
 
 cmd_commit() {
     [ $# -eq 0 ] || usage_error 'commit takes no arguments'
-    lbu commit -d || die 'lbu commit failed'
-    # lbu names the file after the hostname; drop files from earlier names.
+    if [ -f "$UPDATE_MARK" ]; then
+        die 'an update is on the disk; reboot before saving configuration'
+    fi
+    media_rw
     _cm_keep="$(hostname).apkovl.tar.gz"
-    mount -o remount,rw "$MEDIA" 2>/dev/null || true
+    _cm_saved=''
+    if [ -f "$MEDIA/$_cm_keep" ]; then
+        _cm_saved=$(mktemp /tmp/kiosk-apkovl.XXXXXX)
+        cp -a -- "$MEDIA/$_cm_keep" "$_cm_saved" || die 'cannot keep a copy of the current configuration'
+    fi
+    if ! lbu commit -d; then
+        rm -f -- "$_cm_saved"
+        media_ro
+        die 'lbu commit failed'
+    fi
+    # lbu remounts the disk read-only when it finishes.
+    media_rw
+    if ! tar -tzf "$MEDIA/$_cm_keep" usr/local/bin/kiosk-mosaic >/dev/null 2>&1; then
+        if [ -n "$_cm_saved" ] && [ -f "$_cm_saved" ]; then
+            cp -a -- "$_cm_saved" "$MEDIA/$_cm_keep"
+            sync
+        fi
+        rm -f -- "$_cm_saved"
+        media_ro
+        die 'the save dropped /usr/local/bin/kiosk-mosaic; the previous configuration was put back'
+    fi
+    rm -f -- "$_cm_saved"
+    # lbu names the file after the hostname; drop files from earlier names.
     for _cm_file in "$MEDIA"/*.apkovl.tar.gz; do
         [ -e "$_cm_file" ] || continue
         [ "${_cm_file##*/}" != "$_cm_keep" ] || continue
         rm -f -- "$_cm_file"
     done
-    sync
-    mount -o remount,ro "$MEDIA" 2>/dev/null || true
+    media_ro
     printf 'configuration saved\n'
 }
 
@@ -233,11 +305,348 @@ cmd_show() {
         printf 'camera credentials: none\n'
     fi
     printf 'daily reboot: %s\n' "$(reboot_time)"
+    if [ -f "$UPDATE_DIR/READY" ]; then
+        printf 'staged update: %s\n' "$(cat "$UPDATE_DIR/READY")"
+    else
+        printf 'staged update: none\n'
+    fi
     if [ -f "$HOST_CERT" ]; then
         printf 'host certificate: %s\n' "$(ssh-keygen -L -f "$HOST_CERT" | awk '/Valid:/ { $1 = ""; print }')"
     else
         printf 'host certificate: none\n'
     fi
+}
+
+# Mounts the internal disk read-write.
+media_rw() {
+    if ! grep -q " $MEDIA " /proc/mounts; then
+        mkdir -p -- "$MEDIA"
+        mount "$MEDIA" || die "cannot mount $MEDIA"
+    fi
+    mount -o remount,rw "$MEDIA" || die "cannot write to $MEDIA"
+    # die() and any later failure must not leave the internal disk writable.
+    trap 'media_ro' EXIT
+}
+
+media_ro() {
+    sync
+    mount -o remount,ro "$MEDIA" 2>/dev/null || true
+}
+
+# Fails when tar member $1 is not part of an update bundle.
+update_member_ok() {
+    case $1 in
+        *..* | /*) return 1 ;;
+        SHA256SUMS | SHA256SUMS.sig | payload | payload/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Prints $1 and returns 1. Callers decide how to clean up; die() would skip that.
+update_reject() {
+    printf '%s: %s\n' "$PROGNAME" "$1" >&2
+    return 1
+}
+
+# Checks the signature and the file list in directory $1 (extracted bundle).
+verify_update_tree() {
+    _vu=$1
+    [ -f "$_vu/SHA256SUMS" ] && [ -f "$_vu/SHA256SUMS.sig" ] && [ -d "$_vu/payload" ] ||
+        update_reject 'the update bundle is missing its signature or payload' || return 1
+    [ -f "$BUILD_PUB" ] || update_reject "no package signing key at $BUILD_PUB" || return 1
+    openssl dgst -sha256 -verify "$BUILD_PUB" -signature "$_vu/SHA256SUMS.sig" \
+        "$_vu/SHA256SUMS" >/dev/null 2>&1 ||
+        update_reject 'the update signature does not match this kiosk'\''s signing key' || return 1
+    _vu_sums=$(mktemp /tmp/kiosk-sums.XXXXXX)
+    _vu_files=$(mktemp /tmp/kiosk-files.XXXXXX)
+    _vu_raw=$(mktemp /tmp/kiosk-sumsraw.XXXXXX)
+    if ! awk '{
+        if (NF != 2 || $2 ~ /(^\/|\.\.)/) exit 1
+        print $2
+    }' "$_vu/SHA256SUMS" >"$_vu_raw"; then
+        rm -f -- "$_vu_sums" "$_vu_files" "$_vu_raw"
+        update_reject 'the signed file list is not usable' || return 1
+    fi
+    LC_ALL=C sort "$_vu_raw" >"$_vu_sums"
+    rm -f -- "$_vu_raw"
+    find "$_vu/payload" -type f | while IFS= read -r _vu_path; do
+        printf '%s\n' "${_vu_path#"$_vu/payload/"}"
+    done | LC_ALL=C sort >"$_vu_files"
+    if ! cmp -s "$_vu_sums" "$_vu_files"; then
+        rm -f -- "$_vu_sums" "$_vu_files"
+        update_reject 'the payload does not match the signed file list' || return 1
+    fi
+    rm -f -- "$_vu_sums" "$_vu_files"
+    (cd "$_vu/payload" && sha256sum -c "$_vu/SHA256SUMS") >/dev/null 2>&1 ||
+        update_reject 'a file in the update does not match its checksum' || return 1
+    [ -s "$_vu/payload/release.txt" ] || update_reject 'the update has no release.txt' || return 1
+    [ -f "$_vu/payload/base.apkovl.tar.gz" ] ||
+        update_reject 'the update has no base configuration' || return 1
+    [ -f "$_vu/payload/boot/vmlinuz-lts" ] || update_reject 'the update has no kernel' || return 1
+    return 0
+}
+
+cmd_stage_update() {
+    [ $# -eq 0 ] || usage_error 'stage-update takes no arguments; give the bundle on standard input'
+    [ -t 0 ] && die 'give the update bundle on standard input'
+    command -v openssl >/dev/null 2>&1 || die 'openssl is not installed; re-image this unit from a stick that has it'
+    media_rw
+    _csu_tar=$MEDIA/.update.tar
+    _csu_incoming=$MEDIA/.update-incoming
+    rm -rf -- "$_csu_incoming"
+    rm -f -- "$_csu_tar"
+    if ! cat >"$_csu_tar"; then
+        rm -f -- "$_csu_tar"
+        media_ro
+        die 'the upload was incomplete; nothing was staged'
+    fi
+    _csu_list=$(mktemp /tmp/kiosk-tar.XXXXXX)
+    if ! tar -tzf "$_csu_tar" >"$_csu_list"; then
+        rm -f -- "$_csu_tar" "$_csu_list"
+        media_ro
+        die 'the upload is not a tar archive'
+    fi
+    _csu_bad=''
+    while IFS= read -r _csu_member || [ -n "$_csu_member" ]; do
+        _csu_member=${_csu_member#./}
+        if ! update_member_ok "$_csu_member"; then
+            _csu_bad="$_csu_member"
+            break
+        fi
+    done <"$_csu_list"
+    rm -f -- "$_csu_list"
+    if [ -n "$_csu_bad" ]; then
+        rm -f -- "$_csu_tar"
+        media_ro
+        die "the bundle contains an unexpected path: $_csu_bad"
+    fi
+    _csu_free=$(df -k "$MEDIA" | awk 'NR == 2 { print $4 }')
+    _csu_need=$(($(wc -c <"$_csu_tar") / 1024 + 65536))
+    if [ "$_csu_free" -lt "$_csu_need" ]; then
+        rm -f -- "$_csu_tar"
+        media_ro
+        die 'not enough free space on the internal disk to unpack the update'
+    fi
+    mkdir -p -- "$_csu_incoming"
+    if ! tar -xzf "$_csu_tar" -C "$_csu_incoming"; then
+        rm -rf -- "$_csu_incoming"
+        rm -f -- "$_csu_tar"
+        media_ro
+        die 'cannot unpack the update'
+    fi
+    rm -f -- "$_csu_tar"
+    if ! verify_update_tree "$_csu_incoming"; then
+        rm -rf -- "$_csu_incoming"
+        media_ro
+        exit 1
+    fi
+    rm -rf -- "$UPDATE_DIR"
+    mv -- "$_csu_incoming" "$UPDATE_DIR"
+    cp -- "$UPDATE_DIR/payload/release.txt" "$UPDATE_DIR/READY"
+    media_ro
+    printf 'staged update %s\n' "$(cat "$UPDATE_DIR/READY")"
+}
+
+# Writes a 1024-byte GRUB environment block to $1, with no variables set.
+write_grub_env() {
+    _we_tmp=$1.tmp.$$
+    awk 'BEGIN {
+        out = "# GRUB Environment Block\n"
+        while (length(out) < 1024)
+            out = out "#"
+        printf "%s", substr(out, 1, 1024)
+    }' >"$_we_tmp" || {
+        rm -f -- "$_we_tmp"
+        return 1
+    }
+    mv -f -- "$_we_tmp" "$1"
+}
+
+# Copies $3 from tree $1 onto tree $2 when the file exists.
+preserve_file() {
+    [ -f "$1/$3" ] || return 0
+    _pf_dir=${3%/*}
+    [ "$_pf_dir" = "$3" ] && _pf_dir=.
+    mkdir -p -- "$2/$_pf_dir"
+    cp -a -- "$1/$3" "$2/$3"
+}
+
+# Renames $2 to $2.prev and puts $1 in its place. Returns 1 if the disk was left as it was.
+swap_tree() {
+    _sw_src=$1
+    _sw_dst=$2
+    [ -d "$_sw_src" ] || update_reject "staged update has no ${_sw_dst##*/}" || return 1
+    rm -rf -- "$_sw_dst.prev"
+    if [ -d "$_sw_dst" ]; then
+        mv -- "$_sw_dst" "$_sw_dst.prev" || update_reject "cannot move ${_sw_dst##*/} aside" || return 1
+    fi
+    if ! mv -- "$_sw_src" "$_sw_dst"; then
+        if [ -d "$_sw_dst.prev" ]; then
+            mv -- "$_sw_dst.prev" "$_sw_dst" || true
+        fi
+        update_reject "cannot install new ${_sw_dst##*/}; the previous copy was put back" || return 1
+    fi
+    return 0
+}
+
+# Puts $1 back from $1.prev after a failed apply. $1 is a path such as $MEDIA/boot.
+unswap_tree() {
+    [ -d "$1.prev" ] || return 0
+    rm -rf -- "$1.failed"
+    mv -- "$1" "$1.failed" || return 1
+    mv -- "$1.prev" "$1" || return 1
+    rm -rf -- "$1.failed"
+}
+
+# Copies this unit's files from extracted overlay $1 onto base overlay $2,
+# sets release $3, and keeps the daily reboot line.
+merge_unit_overlay() {
+    _mu_old=$1
+    _mu_new=$2
+    _mu_rel=$3
+    for _mu_path in \
+        etc/hostname \
+        etc/network/interfaces \
+        etc/localtime \
+        etc/timezone \
+        etc/kiosk/layout.conf \
+        etc/kiosk/camera.env \
+        etc/kiosk/unit.conf \
+        etc/ssh/ssh_host_ed25519_key \
+        etc/ssh/ssh_host_ed25519_key.pub \
+        etc/ssh/ssh_host_ed25519_key-cert.pub \
+        etc/ssh/sshd_config.d/10-hostcert.conf; do
+        preserve_file "$_mu_old" "$_mu_new" "$_mu_path"
+    done
+    if [ -f "$_mu_new/etc/kiosk/unit.conf" ]; then
+        awk -v rel="$_mu_rel" 'index($0, "release=") == 1 { print "release=" rel; next } { print }' \
+            "$_mu_new/etc/kiosk/unit.conf" >"$_mu_new/etc/kiosk/unit.conf.new"
+        mv -f -- "$_mu_new/etc/kiosk/unit.conf.new" "$_mu_new/etc/kiosk/unit.conf"
+    fi
+    if [ -f "$_mu_old/etc/crontabs/root" ]; then
+        _mu_reboot=$(grep -F -- "$CRON_MARK" "$_mu_old/etc/crontabs/root" | head -n 1 || true)
+        if [ -n "$_mu_reboot" ]; then
+            mkdir -p -- "$_mu_new/etc/crontabs"
+            [ -f "$_mu_new/etc/crontabs/root" ] || : >"$_mu_new/etc/crontabs/root"
+            grep -vF -- "$CRON_MARK" "$_mu_new/etc/crontabs/root" >"$_mu_new/etc/crontabs/root.new" || true
+            printf '%s\n' "$_mu_reboot" >>"$_mu_new/etc/crontabs/root.new"
+            chmod 600 "$_mu_new/etc/crontabs/root.new"
+            mv -f -- "$_mu_new/etc/crontabs/root.new" "$_mu_new/etc/crontabs/root"
+        fi
+    fi
+}
+
+cmd_apply_update() {
+    [ $# -eq 0 ] || usage_error 'apply-update takes no arguments'
+    [ -f "$UPDATE_DIR/READY" ] || die 'no staged update'
+    verify_update_tree "$UPDATE_DIR" || exit 1
+    media_rw
+    _cau_host=$(hostname)
+    _cau_current=$MEDIA/$_cau_host.apkovl.tar.gz
+    [ -f "$_cau_current" ] || die "no saved configuration at $_cau_current"
+    _cau_old=$(mktemp -d /tmp/kiosk-old.XXXXXX)
+    _cau_new=$(mktemp -d /tmp/kiosk-new.XXXXXX)
+    trap 'rm -rf -- "$_cau_old" "$_cau_new"; media_ro' EXIT
+    tar -xzf "$_cau_current" -C "$_cau_old" || die 'cannot read the current configuration'
+    tar -xzf "$UPDATE_DIR/payload/base.apkovl.tar.gz" -C "$_cau_new" ||
+        die 'cannot read the new configuration'
+    _cau_rel=$(tr -d '\n' <"$UPDATE_DIR/payload/release.txt")
+    merge_unit_overlay "$_cau_old" "$_cau_new" "$_cau_rel"
+    mkdir -p -- "$PREV_DIR"
+    cp -a -- "$_cau_current" "$PREV_DIR/overlay.tar.gz"
+    tar -czf "$MEDIA/$_cau_host.apkovl.tar.gz.new" -C "$_cau_new" etc usr home ||
+        die 'cannot write the merged configuration'
+    rm -rf -- "$_cau_old" "$_cau_new"
+    if ! tar -tzf "$MEDIA/$_cau_host.apkovl.tar.gz.new" usr/local/bin/kiosk-mosaic >/dev/null 2>&1; then
+        rm -f -- "$MEDIA/$_cau_host.apkovl.tar.gz.new"
+        media_ro
+        die 'the new configuration is missing kiosk-mosaic; the disk was not changed'
+    fi
+    mv -f -- "$MEDIA/$_cau_host.apkovl.tar.gz.new" "$_cau_current"
+    if ! swap_tree "$UPDATE_DIR/payload/boot" "$MEDIA/boot"; then
+        cp -a -- "$PREV_DIR/overlay.tar.gz" "$_cau_current"
+        media_ro
+        exit 1
+    fi
+    if ! swap_tree "$UPDATE_DIR/payload/efi" "$MEDIA/efi"; then
+        unswap_tree "$MEDIA/boot" || true
+        cp -a -- "$PREV_DIR/overlay.tar.gz" "$_cau_current"
+        rm -rf -- "$UPDATE_DIR"
+        media_ro
+        exit 1
+    fi
+    if ! swap_tree "$UPDATE_DIR/payload/apks" "$MEDIA/apks"; then
+        unswap_tree "$MEDIA/efi" || true
+        unswap_tree "$MEDIA/boot" || true
+        cp -a -- "$PREV_DIR/overlay.tar.gz" "$_cau_current"
+        rm -rf -- "$UPDATE_DIR"
+        media_ro
+        exit 1
+    fi
+    if [ -f "$MEDIA/release.txt" ]; then
+        cp -a -- "$MEDIA/release.txt" "$PREV_DIR/release.txt"
+    fi
+    cp -- "$UPDATE_DIR/payload/release.txt" "$MEDIA/release.txt"
+    mkdir -p -- "$MEDIA/boot/grub"
+    write_grub_env "$MEDIA/boot/grub/grubenv" || die 'cannot prepare the boot menu'
+    : >"$MEDIA/boot/update-pending"
+    rm -rf -- "$UPDATE_DIR"
+    : >"$UPDATE_MARK"
+    media_ro
+    printf 'installed update %s; it takes effect at the next reboot\n' "$_cau_rel"
+}
+
+cmd_rollback_update() {
+    [ $# -eq 0 ] || usage_error 'rollback-update takes no arguments'
+    _cr_any=''
+    for _cr_name in boot efi apks; do
+        if [ -d "$MEDIA/$_cr_name.prev" ]; then
+            _cr_any=1
+        fi
+    done
+    [ -n "$_cr_any" ] || die 'no previous release to restore'
+    [ -f "$PREV_DIR/overlay.tar.gz" ] || die 'no previous configuration to restore'
+    media_rw
+    _cr_host=$(hostname)
+    # Configuration first, so a retry after a partial restore does not put
+    # the new boot files back with the old settings.
+    cp -a -- "$PREV_DIR/overlay.tar.gz" "$MEDIA/$_cr_host.apkovl.tar.gz"
+    if [ -f "$PREV_DIR/release.txt" ]; then
+        cp -a -- "$PREV_DIR/release.txt" "$MEDIA/release.txt"
+    fi
+    for _cr_name in boot efi apks; do
+        [ -d "$MEDIA/$_cr_name.prev" ] || continue
+        rm -rf -- "$MEDIA/$_cr_name.rolling"
+        mv -- "$MEDIA/$_cr_name" "$MEDIA/$_cr_name.rolling"
+        if ! mv -- "$MEDIA/$_cr_name.prev" "$MEDIA/$_cr_name"; then
+            mv -- "$MEDIA/$_cr_name.rolling" "$MEDIA/$_cr_name" || true
+            media_ro
+            die "cannot restore $_cr_name"
+        fi
+        # Drop the release we just left. A second rollback then has nothing
+        # to swap back, so it cannot mix the two releases.
+        rm -rf -- "$MEDIA/$_cr_name.rolling"
+    done
+    rm -f -- "$UPDATE_MARK"
+    rm -rf -- "$MEDIA/boot.prev" "$MEDIA/efi.prev" "$MEDIA/apks.prev" "$PREV_DIR"
+    media_ro
+    printf 'previous release restored; it takes effect at the next reboot\n'
+}
+
+# Called from boot once this kernel has reached userspace. The previous
+# kernel keeps the flag, so the menu continues to default to it.
+cmd_confirm_boot() {
+    [ $# -eq 0 ] || usage_error 'confirm-boot takes no arguments'
+    grep -q 'cakio-slot=current' /proc/cmdline || return 0
+    if ! grep -q " $MEDIA " /proc/mounts; then
+        mount "$MEDIA" 2>/dev/null || return 0
+    fi
+    [ -f "$MEDIA/boot/update-pending" ] || return 0
+    media_rw
+    mkdir -p -- "$MEDIA/boot/grub"
+    write_grub_env "$MEDIA/boot/grub/grubenv" || die 'cannot reset the boot menu state'
+    rm -f -- "$MEDIA/boot/update-pending"
+    media_ro
 }
 
 main() {
@@ -247,7 +656,8 @@ main() {
             usage
             exit 0
             ;;
-        hostname | layout | creds | reboot-time | hostcert | clock | restart | commit | show) ;;
+        hostname | layout | creds | reboot-time | hostcert | clock | restart | commit | show | \
+            stage-update | apply-update | rollback-update | confirm-boot) ;;
         -*) usage_error "unrecognized option '$1'" ;;
         *) usage_error "unknown command '$1'" ;;
     esac
@@ -257,8 +667,14 @@ main() {
     case $_mn_cmd in
         restart) restart_wall ;;
         reboot-time) cmd_reboot_time "$@" ;;
+        stage-update) cmd_stage_update "$@" ;;
+        apply-update) cmd_apply_update "$@" ;;
+        rollback-update) cmd_rollback_update "$@" ;;
         *) "cmd_$_mn_cmd" "$@" ;;
     esac
 }
 
-main "$@"
+# Tests source this file with KIOSK_APPLY_LIBRARY=1 and call the functions.
+if [ "${KIOSK_APPLY_LIBRARY:-}" != 1 ]; then
+    main "$@"
+fi

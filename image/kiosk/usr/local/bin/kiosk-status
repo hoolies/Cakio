@@ -44,7 +44,15 @@ printf 'root tmpfs: %s\n' "$(df -h / | awk 'NR == 2 { print $3 " used of " $2 }'
 if [ -e /sys/block/zram0/disksize ]; then
     printf 'zram swap: %s\n' "$(awk '/zram0/ { printf "%d MB used of %d MB", $4 / 1024, $3 / 1024; found = 1 } END { if (!found) print "not active" }' /proc/swaps)"
 fi
-printf 'time: %s\n' "$(date)"
+_ks_leap=$(chronyc tracking 2>/dev/null | awk -F: '/^Leap status/ {
+    sub(/^[ \t]+/, "", $2)
+    print $2
+    exit
+}')
+printf 'time: %s (%s)\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "${_ks_leap:-not synchronised}"
+if [ -r /media/cakio/.update/READY ]; then
+    printf 'staged update: %s (installs at the next reboot)\n' "$(cat /media/cakio/.update/READY)"
+fi
 reboot_at=$(awk '/# cakio daily reboot$/ { printf "%02d:%02d", $2, $1; exit }' /etc/crontabs/root 2>/dev/null)
 printf 'daily reboot: %s (crond %s)\n' "${reboot_at:-none}" \
     "$(pgrep -f '(^|/)crond( |$)' >/dev/null 2>&1 && printf running || printf 'not running')"
