@@ -38,6 +38,7 @@ section() {
 section 'Unit'
 printf 'hostname: %s\n' "$(hostname)"
 [ -r "$UNIT" ] && cat -- "$UNIT"
+printf 'cpu governor: %s\n' "$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || printf unknown)"
 printf 'uptime:  %s\n' "$(uptime)"
 awk '/MemTotal|MemAvailable/ { printf "%s %d MB\n", $1, $2 / 1024 }' /proc/meminfo
 printf 'root tmpfs: %s\n' "$(df -h / | awk 'NR == 2 { print $3 " used of " $2 }')"
@@ -113,7 +114,10 @@ if [ -s /var/log/kiosk/session.log ] && grep -qv '^pci id for fd' /var/log/kiosk
     printf 'session log:\n'
     grep -v '^pci id for fd' /var/log/kiosk/session.log | tail -n 5
 fi
-printf 'ffmpeg processes: %s, ffplay processes: %s\n' "$(pgrep -f '(^|/)ffmpeg ' | wc -l)" "$(pgrep -f '(^|/)ffplay ' | wc -l)"
+printf 'players: mpv %s, ffplay %s, ffmpeg %s\n' \
+    "$(pgrep -f '(^|/)mpv ' | wc -l)" \
+    "$(pgrep -f '(^|/)ffplay ' | wc -l)" \
+    "$(pgrep -f '(^|/)ffmpeg ' | wc -l)"
 if command -v vainfo >/dev/null 2>&1; then
     printf 'GPU decoding: %s\n' "$(vainfo --display drm --device /dev/dri/renderD128 2>/dev/null | grep -c 'VAProfileH264\|VAProfileHEVC' | sed 's/^0$/not available/; s/^[1-9].*/available/')"
 fi

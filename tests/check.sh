@@ -78,6 +78,19 @@ check_layouts() {
         return 0
     fi
     grep -q '15 fps' "$TMP/fps.out" || fail '--fps 15 did not override the layout'
+    grep -q 'mpv ' "$_cl_out" || fail 'tiles mode did not play with mpv'
+    grep -q 'panscan=1.0' "$_cl_out" || fail 'tiles mode did not fill by cropping in the player'
+    if grep -q 'thread_queue_size 512' "$_cl_out"; then
+        fail 'tiles mode still queued 512 packets'
+    fi
+    if ! show_layout --mode single "$ROOT/layouts/default.conf" >"$TMP/single.out" 2>"$TMP/single.err"; then
+        fail '--mode single was rejected'
+        cat "$TMP/single.err" >&2
+        return 0
+    fi
+    grep -q 'thread_queue_size 8' "$TMP/single.out" || fail 'single mode did not use a short input queue'
+    grep -q 'muxdelay 0' "$TMP/single.out" || fail 'single mode did not turn mux delay off'
+    grep -q -- '-sync ext' "$TMP/single.out" || fail 'single mode did not sync ffplay to the wall clock'
 
     cat >"$TMP/open.conf" <<'EOF'
 layout

@@ -2,8 +2,8 @@
 # kiosk-mosaic.sh - show the cameras in a layout file as one labelled mosaic
 # that fills the screen.
 #
-# tiles mode (default): every camera gets its own borderless ffplay window,
-# fed by its own ffmpeg. A camera that fails only affects its own tile, which
+# tiles mode (default): every camera is its own borderless mpv window, reading
+# the camera directly. A camera that fails only affects its own tile, which
 # shows "No signal" until the camera is back. While the network cable is
 # unplugged, the screen shows a message instead of the cameras.
 #
@@ -12,8 +12,8 @@
 #
 # Layout files live in layouts/; start from layouts/default.conf.
 #
-# Needs ffmpeg, ffplay, and a bold sans font. On Alpine:
-#   apk add ffmpeg ffplay font-dejavu mesa-va-gallium
+# Needs ffmpeg, ffplay, mpv, and a bold sans font. On Alpine:
+#   apk add ffmpeg ffplay mpv font-liberation mesa-va-gallium
 #
 # Testing hook: KIOSK_NET_ROOT=DIR makes the cable check read
 # DIR/sys/class/net and DIR/proc/net/route instead of the real ones.
@@ -21,8 +21,8 @@
 set -eu
 
 unalias -a 2>/dev/null || true
-unset -f awk basename cat command date ffmpeg ffplay find kill mkfifo mktemp mv \
-    rm sed sleep uname xrandr 2>/dev/null || true
+unset -f awk basename cat command date ffmpeg ffplay find kill mkfifo mktemp mpv \
+    mv rm sed sleep timeout uname xrandr 2>/dev/null || true
 
 export LC_ALL=C
 
@@ -36,6 +36,9 @@ readonly FALLBACK_RESOLUTION=1920x1080
 readonly STOP_TIMEOUT=3
 # A camera that keeps streaming for this many seconds counts as working.
 readonly LIVE_AFTER=20
+# Compressed packets kept per ffmpeg input. A deep queue replays stale video
+# when the machine falls behind, so this stays near ffmpeg's own realtime size.
+readonly INPUT_QUEUE=8
 readonly SYS_NET="${KIOSK_NET_ROOT:-}/sys/class/net"
 readonly PROC_ROUTE="${KIOSK_NET_ROOT:-}/proc/net/route"
 # Stands in for the temporary directory in --print output.
@@ -79,6 +82,11 @@ PRINT=''
 
 FFMPEG_BIN=''
 FFPLAY_BIN=''
+MPV_BIN=''
+# gpu-next, gpu, or x11. Chosen when the wall starts; print shows gpu-next.
+PLAYER_VO=gpu-next
+LABELS=on
+LABEL_SIZE=auto
 TIMEOUT_OPTION=-timeout
 RENDER_NODE=''
 DECODE=software
@@ -109,6 +117,7 @@ TH=0
 FIFO=''
 FFMPEG_PID=''
 FFPLAY_PID=''
+MPV_PID=''
 SLATE_PID=''
 
 usage() {
@@ -119,19 +128,21 @@ Mandatory arguments to long options are mandatory for short options too.
   -r, --resolution=WxH     mosaic size; auto matches the screen (default auto)
       --connector=NAME     screen to measure in auto mode, such as DP-1
                              (default: first connected screen)
-      --mode=MODE          tiles gives every camera its own window, so a failing
-                             camera only affects its tile; single renders the
-                             whole mosaic in one ffmpeg (default tiles)
+      --mode=MODE          tiles plays each camera in its own window, so a
+                             failing camera only affects its tile; single
+                             renders the whole mosaic in one ffmpeg
+                             (default tiles)
       --interface=NAME     network port to watch; while its cable is unplugged
                              the screen asks for the cable instead of showing
                              cameras (default: the first wired port; none skips
                              the check)
-  -f, --fps=N              frames per second (default 10)
+  -f, --fps=N              frames per second for single mode and snapshots
+                             (default 10). Tiles show frames as they arrive
       --fit=MODE           how video fills a tile: fill (crop), fit (letterbox),
                              or stretch (default fill)
       --stream=MODE        camera stream: auto, main, or sub (default auto)
       --sub-max-height=N   in auto mode, use the substream for tiles up to N
-                             pixels tall (default 400)
+                             pixels tall (default 720)
       --hwdec=MODE         video decoding: auto, vaapi, or none (default auto)
       --transport=PROTO    RTSP transport: tcp or udp (default tcp)
       --timeout=SECONDS    give up on a camera that sends nothing for SECONDS
@@ -147,7 +158,7 @@ Mandatory arguments to long options are mandatory for short options too.
                              stops (tiles mode always retries)
       --restart-delay=N    seconds to wait before retrying a camera or restarting
                              the mosaic (default $DEFAULT_RESTART_DELAY)
-      --loglevel=LEVEL     ffmpeg and ffplay log level (default warning)
+      --loglevel=LEVEL     ffmpeg, ffplay, and mpv log level (default warning)
       --test-pattern       show test patterns instead of cameras
       --snapshot=FILE      save one frame of the mosaic to FILE, such as a.png
   -p, --print              print the commands with the password masked, then exit
@@ -419,6 +430,14 @@ find_ffplay() {
     fi
 
     die 'ffplay was not found; install ffplay (Alpine: apk add ffplay) or add it to PATH'
+}
+
+find_mpv() {
+    if MPV_BIN=$(command -v mpv); then
+        return 0
+    fi
+
+    die 'mpv was not found; install mpv (Alpine: apk add mpv) or add it to PATH'
 }
 
 # Sets DETECTED to the screen's preferred mode, such as 1920x1080.
@@ -737,7 +756,7 @@ BEGIN {
     def["fps"] = 10
     def["fit"] = "fill"
     def["stream"] = "auto"
-    def["sub_max_height"] = 400
+    def["sub_max_height"] = 720
     def["main_path"] = "/rtsp_tunnel"
     def["sub_path"] = "/rtsp_tunnel?inst=2"
     def["port"] = 554
@@ -921,11 +940,11 @@ END {
 
         chain = "fps=" fps ","
         if (fit == "fill")
-            chain = chain "scale=" w ":" h ":force_original_aspect_ratio=increase:force_divisible_by=2:flags=bilinear,crop=" w ":" h
+            chain = chain "scale=" w ":" h ":force_original_aspect_ratio=increase:force_divisible_by=2:flags=fast_bilinear,crop=" w ":" h
         else if (fit == "fit")
-            chain = chain "scale=" w ":" h ":force_original_aspect_ratio=decrease:force_divisible_by=2:flags=bilinear,pad=" w ":" h ":(ow-iw)/2:(oh-ih)/2:color=black"
+            chain = chain "scale=" w ":" h ":force_original_aspect_ratio=decrease:force_divisible_by=2:flags=fast_bilinear,pad=" w ":" h ":(ow-iw)/2:(oh-ih)/2:color=black"
         else
-            chain = chain "scale=" w ":" h ":flags=bilinear"
+            chain = chain "scale=" w ":" h ":flags=fast_bilinear"
         chain = chain ",format=yuv420p,setsar=1"
         if (labels == "on")
             chain = chain "," drawtext(label_of(tok), w, h, label_size)
@@ -947,7 +966,7 @@ END {
         graph = graph "[v0]pad=" W ":" H ":" first_x ":" first_y ":color=black,format=yuv420p[out]"
     else
         graph = graph stack "xstack=inputs=" n ":layout=" positions ":fill=black:shortest=1,format=yuv420p[out]"
-    print "C|" W "|" H "|" cols "|" rows "|" n "|" fps "|" labels "|" source
+    print "C|" W "|" H "|" cols "|" rows "|" n "|" fps "|" labels "|" source "|" label_size
     print "G|" graph
     print "M|0|" message_graph(W, H)
 }' <"$LAYOUT"
@@ -964,6 +983,12 @@ END {
 $SPEC
 EOF
     [ -n "$GRAPH" ] || die 'internal error: no filter graph was generated'
+    # C|w|h|cols|rows|cameras|fps|labels|source|label_size
+    IFS='|' read -r _ _ _ _ _ _ _ LABELS _ LABEL_SIZE <<EOF
+$CANVAS
+EOF
+    [ -n "$LABELS" ] || LABELS=on
+    [ -n "$LABEL_SIZE" ] || LABEL_SIZE=auto
     return 0
 }
 
@@ -1146,7 +1171,10 @@ print_command() {
             _pc_first=''
         else
             case $_pc_arg in
-                -thread_queue_size | -filter_complex | -vf | -map) printf ' \\\n    ' ;;
+                -thread_queue_size | -filter_complex | -vf | -map | --profile | \
+                    --geometry | --geometry=* | --hwdec | --hwdec=* | --vo | --vo=* | \
+                    --sub-file | --demuxer-lavf-o-add | --demuxer-lavf-o-add*) printf ' \\\n    ' ;;
+                rtsp://* | av://*) printf ' \\\n    ' ;;
                 *) printf ' ' ;;
             esac
         fi
@@ -1205,7 +1233,7 @@ ffmpeg_command() {
         if [ -n "$_fc_tile" ] && [ "$_fc_n" != "$_fc_tile" ]; then
             continue
         fi
-        set -- "$@" -thread_queue_size 512
+        set -- "$@" -thread_queue_size "$INPUT_QUEUE"
         if [ -n "$TEST_PATTERN" ]; then
             if [ "$_fc_stream" = sub ]; then
                 _fc_size=640x360
@@ -1220,8 +1248,11 @@ ffmpeg_command() {
             continue
         fi
 
-        set -- "$@" -rtsp_transport "$TRANSPORT" -allowed_media_types video \
-            "$TIMEOUT_OPTION" "$((TIMEOUT * 1000000))" -fflags +nobuffer
+        set -- "$@" -probesize 32 -analyzeduration 0 -fpsprobesize 0 \
+            -fflags +nobuffer+discardcorrupt -flags low_delay \
+            -reorder_queue_size 0 -max_delay 0 \
+            -rtsp_transport "$TRANSPORT" -allowed_media_types video \
+            "$TIMEOUT_OPTION" "$((TIMEOUT * 1000000))"
         if [ "$TIMESTAMPS" = arrival ]; then
             set -- "$@" -use_wallclock_as_timestamps 1
         fi
@@ -1239,7 +1270,7 @@ EOF
     else
         set -- "$@" -filter_complex "$GRAPH" -map '[out]'
     fi
-    set -- "$@" -an
+    set -- "$@" -an -muxdelay 0 -muxpreload 0 -flush_packets 1 -fps_mode passthrough
     case $_fc_action in
         *-display)
             set -- "$@" -c:v rawvideo -f nut
@@ -1269,8 +1300,9 @@ ffplay_command() {
     _pl_action=$1
     _pl_input=$2
     _pl_tile=${3:-}
-    set -- -hide_banner -loglevel "$LOGLEVEL" -fflags nobuffer -flags low_delay \
-        -framedrop -autoexit -an -sn
+    set -- -hide_banner -loglevel "$LOGLEVEL" -fflags nobuffer \
+        -flags low_delay -framedrop -sync ext -probesize 32 -analyzeduration 0 \
+        -autoexit -an -sn
     if [ -n "$_pl_tile" ]; then
         tile_info "$_pl_tile"
         set -- "$@" -noborder -left "$TX" -top "$TY" -x "$TW" -y "$TH" \
@@ -1286,6 +1318,203 @@ ffplay_command() {
             FFPLAY_PID=$!
             ;;
         print) print_command ffplay "$@" ;;
+    esac
+}
+
+# OpenGL present is the low-latency path. X11 is the fallback when the GPU
+# output cannot start, which a virtual machine often cannot.
+choose_vo() {
+    PLAYER_VO=x11
+    if probe_vo gpu-next; then
+        PLAYER_VO=gpu-next
+        return 0
+    fi
+    if probe_vo gpu; then
+        PLAYER_VO=gpu
+        return 0
+    fi
+    warn 'OpenGL is not available; tiles will be drawn by X11'
+    return 0
+}
+
+# $1 = mpv --vo name. Succeeds when one test frame can be shown that way.
+probe_vo() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 "$MPV_BIN" --no-config --vo="$1" --gpu-api=opengl --hwdec=no \
+            --frames=1 --really-quiet --audio=no --input-terminal=no \
+            av://lavfi:color=c=black:s=64x64:d=0.1 </dev/null >/dev/null 2>&1
+        return $?
+    fi
+    "$MPV_BIN" --no-config --vo="$1" --gpu-api=opengl --hwdec=no \
+        --frames=1 --really-quiet --audio=no --input-terminal=no \
+        av://lavfi:color=c=black:s=64x64:d=0.1 </dev/null >/dev/null 2>&1
+}
+
+# Fontconfig name for the file find_font chose, used by the tile label.
+font_name() {
+    case $FONT_PATH in
+        *DejaVu*) printf '%s\n' 'DejaVu Sans' ;;
+        *Liberation*) printf '%s\n' 'Liberation Sans' ;;
+        *Arial*) printf '%s\n' 'Arial' ;;
+        *) printf '%s\n' 'Sans' ;;
+    esac
+}
+
+# Escapes $1 for an ASS dialogue line.
+ass_text() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/{/\\{/g; s/}/\\}/g'
+}
+
+# Prints the label size in pixels for a tile of width $1 and height $2 showing $3.
+label_pixels() {
+    _lp_fs=$LABEL_SIZE
+    if [ "$LABEL_SIZE" = auto ]; then
+        _lp_fs=$((10 + $2 / 30))
+        if [ "$_lp_fs" -gt 72 ]; then
+            _lp_fs=72
+        fi
+        _lp_n=${#3}
+        _lp_room=$(($1 - 16))
+        if [ "$_lp_room" -lt 1 ]; then
+            _lp_room=1
+        fi
+        # About 0.65 em per character. Compare in hundredths to stay in integers.
+        if [ "$_lp_n" -gt 0 ] && [ $((65 * _lp_fs * _lp_n)) -gt $((_lp_room * 100)) ]; then
+            _lp_fs=$((_lp_room * 100 / (65 * _lp_n)))
+        fi
+        if [ "$_lp_fs" -lt 10 ]; then
+            _lp_fs=10
+        fi
+    fi
+    printf '%s\n' "$_lp_fs"
+}
+
+# Writes a static bottom-left label for tile $1. The file is $2.
+write_label() {
+    tile_info "$1"
+    _wl_px=$(label_pixels "$TW" "$TH" "$TILE_LABEL")
+    _wl_font=$(font_name)
+    _wl_text=$(ass_text "$TILE_LABEL")
+    cat >"$2.tmp" <<EOF
+[Script Info]
+ScriptType: v4.00+
+PlayResX: ${TW}
+PlayResY: ${TH}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Label,${_wl_font},${_wl_px},&H00FFFFFF,&H000000FF,&H00000000,&H59000000,-1,0,0,0,100,100,0,0,3,8,0,1,16,16,16,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,999:00:00.00,Label,,0,0,0,,${_wl_text}
+EOF
+    mv -f -- "$2.tmp" "$2"
+}
+
+mpv_log_level() {
+    case $LOGLEVEL in
+        quiet | panic | fatal) printf '%s\n' fatal ;;
+        error) printf '%s\n' error ;;
+        warning) printf '%s\n' warn ;;
+        info) printf '%s\n' info ;;
+        verbose | debug) printf '%s\n' debug ;;
+        trace) printf '%s\n' trace ;;
+    esac
+}
+
+# $1 = run or print, $2 = tile index. run starts mpv and sets MPV_PID.
+# The window is the tile. The player scales; the video is not scaled in software.
+mpv_command() {
+    _mv_action=$1
+    _mv_tile=$2
+    if [ "$_mv_action" = print ]; then
+        _mv_userinfo="${ENC_USER:-USER}:****"
+    else
+        _mv_userinfo="$ENC_USER:$ENC_PASS"
+    fi
+
+    tile_info "$_mv_tile"
+    _mv_found=''
+    while IFS='|' read -r _mv_kind _mv_n _ _ _ _mv_addr _mv_port _mv_path _mv_stream _mv_fit _; do
+        [ "$_mv_kind" = T ] || continue
+        [ "$_mv_n" = "$_mv_tile" ] || continue
+        _mv_found=1
+        break
+    done <<EOF
+$SPEC
+EOF
+    [ -n "$_mv_found" ] || die "internal error: no camera for tile $_mv_tile"
+
+    if [ -n "$TEST_PATTERN" ]; then
+        if [ "$_mv_stream" = sub ]; then
+            _mv_size=640x360
+        else
+            _mv_size=1920x1080
+        fi
+        _mv_url="av://lavfi:testsrc2=size=${_mv_size}:rate=30,realtime"
+    else
+        _mv_url="rtsp://${_mv_userinfo}@${_mv_addr}:${_mv_port}${_mv_path}"
+    fi
+
+    _mv_level=$(mpv_log_level)
+    set -- --no-config --load-scripts=no --profile=low-latency \
+        --untimed=yes --cache=no --cache-pause=no --demuxer-readahead-secs=0 \
+        --demuxer-max-bytes=512KiB --vd-lavc-threads=1 \
+        --vd-lavc-o-add=flags=+low_delay --video-latency-hacks=yes \
+        --framedrop=vo --video-sync=desync --interpolation=no --audio=no \
+        --demuxer-lavf-analyzeduration=0 --demuxer-lavf-probesize=32 \
+        --demuxer-lavf-probe-info=nostreams --demuxer-lavf-buffersize=4096 \
+        --osd-level=0 --osc=no --input-terminal=no --input-default-bindings=no \
+        --input-vo-keyboard=no --cursor-autohide=always --keep-open=no \
+        --no-border --keepaspect-window=no --auto-window-resize=no \
+        --hidpi-window-scale=no \
+        --geometry="${TW}x${TH}+${TX}+${TY}" \
+        --title "$PROGNAME tile $TILE_TOK" \
+        --msg-level="all=${_mv_level}"
+
+    case $_mv_fit in
+        fill) set -- "$@" --keepaspect=yes --panscan=1.0 ;;
+        fit) set -- "$@" --keepaspect=yes --panscan=0 ;;
+        *) set -- "$@" --keepaspect=no ;;
+    esac
+
+    if [ "$DECODE" = vaapi ]; then
+        set -- "$@" --hwdec=vaapi
+    else
+        set -- "$@" --hwdec=no
+    fi
+    set -- "$@" --vo="$PLAYER_VO"
+    if [ "$PLAYER_VO" != x11 ]; then
+        set -- "$@" --gpu-api=opengl
+    fi
+
+    if [ -z "$TEST_PATTERN" ]; then
+        set -- "$@" --rtsp-transport "$TRANSPORT" --network-timeout "$TIMEOUT" \
+            --demuxer-lavf-o-add=fflags=+nobuffer+discardcorrupt \
+            --demuxer-lavf-o-add=reorder_queue_size=0 \
+            --demuxer-lavf-o-add=max_delay=0 \
+            --demuxer-lavf-o-add=fpsprobesize=0 \
+            --demuxer-lavf-o-add="timeout=$((TIMEOUT * 1000000))"
+    fi
+
+    if [ "$LABELS" = on ]; then
+        _mv_ass="${TMP_DIR:-$PRINT_TMP}/t${_mv_tile}.ass"
+        if [ "$_mv_action" = run ]; then
+            write_label "$_mv_tile" "$_mv_ass"
+        fi
+        set -- "$@" --sub-file "$_mv_ass" --sub-visibility=yes
+    fi
+    set -- "$@" "$_mv_url"
+
+    case $_mv_action in
+        run)
+            "$MPV_BIN" "$@" </dev/null 2>&3 &
+            MPV_PID=$!
+            ;;
+        print) print_command mpv "$@" ;;
     esac
 }
 
@@ -1337,12 +1566,17 @@ EOF
     else
         _pr_decode=software
     fi
+    if [ "$MODE" = tiles ]; then
+        _pr_player=mpv
+    else
+        _pr_player=ffplay
+    fi
 
     printf '# mosaic %sx%s (%s), grid %sx%s, %s cameras, %s fps, labels %s, %s mode\n' \
         "$_pr_w" "$_pr_h" "$_pr_src" "$_pr_cols" "$_pr_rows" "$_pr_n" \
         "$_pr_fps" "$_pr_labels" "$MODE"
-    printf '# decoding: %s, timestamps: %s, cable check: %s\n' \
-        "$_pr_decode" "$TIMESTAMPS" "${IFACE:-none}"
+    printf '# decoding: %s, player: %s, timestamps: %s, cable check: %s\n' \
+        "$_pr_decode" "$_pr_player" "$TIMESTAMPS" "${IFACE:-none}"
     while IFS='|' read -r _pr_kind _ _pr_tile _pr_id _pr_name _pr_addr _ _ \
         _pr_stream _pr_fit _pr_x _pr_y _pr_tw _pr_th; do
         [ "$_pr_kind" = T ] || continue
@@ -1368,9 +1602,7 @@ EOF
         while IFS='|' read -r _pr_kind _pr_n _pr_tile _; do
             [ "$_pr_kind" = T ] || continue
             printf '\n# tile %s\n' "$_pr_tile"
-            ffmpeg_command print-display - "$_pr_n"
-            printf ' \\\n    | '
-            ffplay_command print - "$_pr_n"
+            mpv_command print "$_pr_n"
             printf '\n'
         done <<EOF
 $SPEC
@@ -1414,13 +1646,15 @@ stop_process() {
 
 # Stops the ffmpeg and ffplay pair of this process.
 stop_children() {
-    for _st_pid in $FFMPEG_PID $FFPLAY_PID; do
+    for _st_pid in $FFMPEG_PID $FFPLAY_PID $MPV_PID; do
         kill -s TERM "$_st_pid" 2>/dev/null || true
     done
     stop_process "$FFMPEG_PID"
     stop_process "$FFPLAY_PID"
+    stop_process "$MPV_PID"
     FFMPEG_PID=''
     FFPLAY_PID=''
+    MPV_PID=''
 }
 
 stop_message() {
@@ -1473,6 +1707,15 @@ check_display() {
     if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}${SDL_VIDEODRIVER:-}" ]; then
         die 'no display found; run this inside an X or Wayland session'
     fi
+}
+
+# ffplay (single mode, slates, the cable message) uploads through SDL.
+# OpenGL scales on the display chip, and vsync off saves a refresh of delay.
+export_player_env() {
+    SDL_VIDEODRIVER=x11
+    SDL_RENDER_DRIVER=opengl
+    SDL_RENDER_VSYNC=0
+    export SDL_VIDEODRIVER SDL_RENDER_DRIVER SDL_RENDER_VSYNC
 }
 
 # Installs the traps, creates the temporary directory, and starts the masker.
@@ -1573,6 +1816,7 @@ run_pipeline() {
 run_single() {
     find_ffplay
     check_display
+    export_player_env
     setup_tmp
     if [ "$RESTART_DELAY" -eq 1 ]; then
         _rs_unit=second
@@ -1612,17 +1856,14 @@ tile_shutdown() {
     exit 143
 }
 
-# Keeps one tile alive: a slate underneath, and a live ffmpeg/ffplay pair on
-# top that is restarted whenever it stops. Runs as a background process.
+# Keeps one tile alive: a slate underneath, and one mpv window on top that
+# reads the camera directly and is restarted whenever it stops. Runs as its
+# own process.
 tile_supervisor() {
     _ts_n=$1
     trap tile_shutdown EXIT TERM HUP
     tile_info "$_ts_n"
     _ts_status=$TMP_DIR/t$_ts_n.txt
-    FIFO=$TMP_DIR/t$_ts_n.nut
-    if [ ! -p "$FIFO" ]; then
-        mkfifo -m 600 -- "$FIFO" || die "cannot create $FIFO"
-    fi
 
     write_text "$_ts_status" 'Connecting to camera'
     slate_command run "$_ts_n"
@@ -1651,9 +1892,8 @@ tile_supervisor() {
 
         _ts_started=$(date +%s)
         _ts_live=''
-        ffplay_command run "$FIFO" "$_ts_n"
-        ffmpeg_command run-display "$FIFO" "$_ts_n"
-        while kill -0 "$FFPLAY_PID" 2>/dev/null && kill -0 "$FFMPEG_PID" 2>/dev/null; do
+        mpv_command run "$_ts_n"
+        while kill -0 "$MPV_PID" 2>/dev/null; do
             sleep 1
             if [ -z "$_ts_live" ] && [ $(($(date +%s) - _ts_started)) -ge "$LIVE_AFTER" ]; then
                 _ts_live=1
@@ -1726,7 +1966,10 @@ stop_tiles() {
 
 run_tiles() {
     find_ffplay
+    find_mpv
     check_display
+    choose_vo
+    export_player_env
     setup_tmp
 
     while :; do

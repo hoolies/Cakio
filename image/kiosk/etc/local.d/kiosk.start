@@ -1,7 +1,7 @@
 #!/bin/sh
 # Boot-time setup for the camera kiosk (runs as root from the local service).
 
-# Processes of other users are hidden; the camera URL is on ffmpeg's command line.
+# Processes of other users are hidden; the camera URL is on the player's command line.
 mount -o remount,hidepid=2 /proc 2>/dev/null
 
 # Logs the kiosk user can write and the administrator can read.
@@ -37,5 +37,22 @@ fi
 if ! /usr/local/bin/kiosk-apply confirm-boot; then
     logger -t kiosk 'this kernel started, but the boot menu flag could not be cleared'
 fi
+
+# Keep every CPU at its highest speed. A powersave clock adds a delay to the
+# first frames after a quiet moment, which shows up as late video.
+set_cpu_governor() {
+    _sg_n=0
+    for _sg_gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [ -w "$_sg_gov" ] || continue
+        if printf 'performance\n' >"$_sg_gov" 2>/dev/null; then
+            _sg_n=$((_sg_n + 1))
+        fi
+    done
+    if [ "$_sg_n" -eq 0 ]; then
+        logger -t kiosk 'CPU frequency governor left unchanged'
+    fi
+}
+
+set_cpu_governor
 
 exit 0

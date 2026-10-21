@@ -42,9 +42,10 @@ those files. Nothing is ever written to the disk while it runs, so a power
 cut cannot corrupt it. Each boot is identical to the last.
 
 **Each camera is its own window.** The screen is split into tiles following
-a layout you write. Every tile is an independent video player. If one camera
-goes down, only its tile says "No signal since 14:32"; the others keep
-playing. When the camera comes back, the tile does too.
+a layout you write. Every tile is its own player, reading that camera
+directly and drawing it on the display chip. If one camera goes down, only
+its tile says "No signal since 14:32"; the others keep playing. When the
+camera comes back, the tile does too.
 
 **It watches the network cable.** If the cable is unplugged, the whole
 screen says "Connect the ethernet cable to view the cameras". Plug it back in
@@ -88,11 +89,11 @@ Install the two tools the build needs (once):
 sudo apt install qemu-system-x86 ovmf
 ```
 
-If you also want to preview layouts on your own screen, install ffmpeg and
-a font:
+If you also want to preview layouts on your own screen, install ffmpeg, mpv,
+and a font:
 
 ```
-sudo apt install ffmpeg fonts-liberation
+sudo apt install ffmpeg mpv fonts-liberation
 ```
 
 ---
@@ -504,21 +505,31 @@ D|1004|Dock|10.20.30.44
 ```
 
 Each tile shows its label in the bottom-left corner: the number, a dash,
-and the name (or just the number if there is no name).
+and the name (or just the number if there is no name). The player draws
+the label over the picture.
 
 Things you can add:
 
 - `fit fill` (default), `fit fit`, or `fit stretch` on its own line: whether
-  video is cropped to fill its tile, letterboxed, or stretched.
-- `fps 10` on its own line: frames per second (default 10, which is plenty
-  for a wall and easy on the hardware).
+  video is cropped to fill its tile, letterboxed, or stretched. The player
+  does this while drawing the window, so the camera frame is not scaled on
+  the CPU first.
+- `fps 10` on its own line: frames per second for single mode and for
+  snapshots (default 10). A tile shows each frame as the camera sends it.
+- `sub_max_height 720`: in auto mode, a tile this tall or shorter uses the
+  camera's second, lower-resolution stream. On a 1080p screen a 2x2 tile is
+  about 540 pixels, so it uses that stream. `stream=main` forces the full one.
 - Per-camera options after a fifth `|`, for example
-  `A|1001|Entrance|10.0.136.11|stream=main,fit=fit`. Small tiles use the
-  camera's second, lower-resolution stream automatically; `stream=main`
-  forces the full one.
+  `A|1001|Entrance|10.0.136.11|stream=main,fit=fit`.
 
-Preview a layout on your own computer before pushing it (needs ffmpeg and a
-font, see "What you need"):
+For the picture to stay close to live, set the camera the same way: H.264
+with no B-frames, the substream's size close to the tile, and the encoder's
+smoothing or latency buffer turned down. Put the kiosk and the cameras on
+the same switch. A shorter GOP only makes a tile appear sooner after a
+reconnect.
+
+Preview a layout on your own computer before pushing it (needs ffmpeg, mpv,
+and a font, see "What you need"):
 
 ```
 ./kiosk-mosaic.sh --test-pattern --snapshot preview.png layouts/default.conf
@@ -670,6 +681,8 @@ only thing that survives, so a unit can never drift into an unknown state.
   worth a look.
 - The Bosch cameras' second stream is assumed at `/rtsp_tunnel?inst=2`.
   If your cameras use a different address, set `sub_path` in the layout.
+  Tiles play that stream directly. The CPU governor is set to `performance`
+  at boot so a quiet moment does not leave the next frame late.
 
 ---
 

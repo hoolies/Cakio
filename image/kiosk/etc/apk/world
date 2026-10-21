@@ -9,6 +9,7 @@ font-liberation
 libva-utils
 mesa-dri-gallium
 mesa-va-gallium
+mpv
 openssl
 openssh-keygen
 openssh-server

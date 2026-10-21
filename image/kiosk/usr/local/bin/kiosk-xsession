@@ -8,6 +8,12 @@
 
 set -u
 
+# ffplay uploads through SDL. OpenGL scales on the display chip.
+SDL_VIDEODRIVER=x11
+SDL_RENDER_DRIVER=opengl
+SDL_RENDER_VSYNC=0
+export SDL_VIDEODRIVER SDL_RENDER_DRIVER SDL_RENDER_VSYNC
+
 readonly LAYOUT=/etc/kiosk/layout.conf
 readonly FONT=/usr/share/fonts/liberation/LiberationSans-Bold.ttf
 readonly RECHECK=15
